@@ -1,0 +1,22 @@
+mcpyida
+Copyright 2026 Nightwing Group, LLC.
+
+This product is licensed under the Apache License, Version 2.0
+(see the LICENSE file in the root of this repository).
+
+------------------------------------------------------------------------
+Third-party attributions
+------------------------------------------------------------------------
+
+This product includes or depends on software developed by third parties.
+The entries below cover dependencies whose licenses require attribution
+in a NOTICE file (Apache-2.0).  The full resolved dependency graph is
+recorded at release time.
+
+All declared runtime dependencies (asgi-lifespan, fastapi, mcp,
+pip-system-certs, and their transitive dependencies including httpx,
+starlette, uvicorn, anyio, pydantic, certifi) are MIT-, BSD-, or
+MPL-licensed and do not require attribution in this NOTICE file; their
+license terms still apply and travel with each installed package.
+
+This NOTICE is regenerated as part of each release.

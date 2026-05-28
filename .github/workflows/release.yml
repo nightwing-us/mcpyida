@@ -1,0 +1,98 @@
+# release.yml — Publish to PyPI on version tag push.
+#
+# PREREQUISITE (one-time setup):
+#   PyPI-side OIDC trusted publisher must be configured before this workflow
+#   can publish.  In your PyPI project settings, add a "pending publisher" with:
+#     Owner:       nightwing-us
+#     Repository:  mcpyida
+#     Workflow:    release.yml
+#     Environment: pypi
+#
+#   See: https://docs.pypi.org/trusted-publishers/adding-a-publisher/
+#
+# This workflow uses no stored PyPI API token.  Authentication is handled
+# entirely via GitHub's OIDC identity and PyPI's trusted publisher mechanism.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write   # Required for PyPI OIDC trusted publisher authentication
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history needed by hatch-vcs to determine version from tags
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tooling
+        run: pip install build
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi   # Must match the environment name in PyPI OIDC config
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No token= needed; authentication is via OIDC (id-token: write above)
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # Required to create the release
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Use the preinstalled `gh` CLI (GitHub-owned, always allowed by
+        # restrictive org action policies) instead of a third-party action.
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*

@@ -1,0 +1,80 @@
+name: CI
+
+# Scope of this workflow
+# ──────────────────────
+# Integration and e2e tests require a live IDA Pro / idalib installation,
+# which is not available on stock GitHub runners (IDA Pro is proprietary
+# commercial software and cannot be bundled into public CI images). Those
+# tiers run in a separate CI environment with an IDA Pro license.
+#
+# This workflow runs LINT + TYPECHECK ONLY:
+#   • Lint      — ruff check + ruff format --check (src/)
+#   • Typecheck — mypy (config in pyproject.toml; targets src/mcpyida;
+#                 IDA modules are Any-typed via overrides so it needs no IDA)
+#
+# Tests are not run here: the unit suite hard-imports IDAPython modules
+# (idaapi, ida_pro, ida_typeinf, …) which require a real IDA installation, so
+# it cannot run on a stock GitHub runner. All test tiers (unit, integration,
+# e2e) run in the licensed CI environment described above.
+#
+# Python matrix: 3.10, 3.11, 3.12 (matches pyproject.toml requires-python).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history needed by hatch-vcs to derive version from tags
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff check)
+        # Scope: src/ only.
+        run: ruff check src
+
+      - name: Format check (ruff format)
+        run: ruff format --check src
+
+      - name: Type-check (mypy)
+        # mypy config in pyproject.toml sets packages = ["mcpyida"] and
+        # mypy_path = "src", so bare `mypy` resolves without an explicit path.
+        # IDA Pro API modules are Any-typed via [[tool.mypy.overrides]] stubs (the
+        # IDA Python API has no public type stubs; idalib is dlopen-loaded at runtime).
+        # warn_return_any is intentionally disabled to avoid ~80 false-positive ignores
+        # on IDA wrapper return sites.
+        run: mypy
+
+      # No pytest here: the test suite requires a real IDA install. Tests run
+      # in the licensed CI environment described in the header.
