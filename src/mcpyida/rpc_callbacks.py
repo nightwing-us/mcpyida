@@ -3,7 +3,8 @@
 Implements:
 - Exception hierarchy (RPCError, RPCTimeoutError, RPCDisconnectedError)
 - CallbackScope: execution-scoped validity token
-- RPCNamespace: the 'rpc' object injected into scripting globals
+- RPCNamespace: internal discovery-state holder for discovered functions
+- project_name / ToolNamespace: project '__'-separated names into nested namespaces
 - generate_callback_function: builds a callable from a FunctionDefinition
 - is_name_safe: name collision protection against Python builtins/keywords
 - map_exception: maps remote exception types to Python exceptions
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import builtins
 import keyword
+import re
 from typing import Any
 
 from mcpyida.rpc_types import FunctionDefinition
@@ -106,16 +108,103 @@ _TYPE_MAP: dict[str, str] = {
 }
 
 
+def _schema_type_to_str(schema_type: Any) -> str:
+    """Map a JSON-Schema ``type`` to a Python type label.
+
+    JSON Schema permits ``type`` to be a *list* of type names (e.g.
+    ``['string', 'null']`` for a nullable field). A bare ``_TYPE_MAP.get()``
+    on that list raises ``TypeError: unhashable type: 'list'``, so accept both
+    the scalar and union forms here.
+    """
+    if isinstance(schema_type, list):
+        return ' | '.join(_TYPE_MAP.get(t, 'Any') for t in schema_type)
+    return _TYPE_MAP.get(schema_type, 'Any')
+
+
+# ---------------------------------------------------------------------------
+# Name projection (__ separators -> nested namespaces)
+# ---------------------------------------------------------------------------
+
+# Runs of two or more underscores act as a single namespace separator.
+_NS_SEPARATOR = re.compile(r'_{2,}')
+
+
+def project_name(raw: str) -> list[str] | None:
+    """Split an RPC function name into a namespace attribute path.
+
+    Runs of two or more underscores are namespace separators; leading,
+    trailing, and repeated separators collapse (empty segments are dropped).
+    A single underscore is preserved within a segment. Hard-keyword segments
+    are escaped with a leading underscore so they stay reachable via dotted
+    attribute access (``mcp.import`` is a SyntaxError; ``mcp._import`` is not).
+    Builtins and soft keywords are valid attribute names and left unescaped.
+
+    Args:
+        raw: The function name from ``mcpy/listFunctions`` (e.g.
+            ``mcp__ghidra1__list``).
+
+    Returns:
+        The list of path segments (e.g. ``['mcp', 'ghidra1', 'list']``), or
+        ``None`` if *raw* yields no segments (e.g. it was all underscores).
+    """
+    segments = [s for s in _NS_SEPARATOR.split(raw) if s]
+    if not segments:
+        return None
+    return ['_' + s if keyword.iskeyword(s) else s for s in segments]
+
+
+class ToolNamespace:
+    """A nested namespace of RPC callback functions.
+
+    Built when projecting ``__``-separated function names into the scripting
+    environment, so ``mcp__ghidra1__list`` is reachable as
+    ``mcp.ghidra1.list(...)``. Children (sub-namespaces or callables) are
+    looked up by attribute access; ``dir()`` and ``repr()`` enumerate them.
+
+    Children are stored in the ``_children`` dict and populated by the
+    server's tree builder; attribute access is resolved via ``__getattr__``
+    so escaped names (e.g. ``_import``) are reachable and private bookkeeping
+    attributes are never shadowed.
+    """
+
+    def __init__(self, path: str = '') -> None:
+        object.__setattr__(self, '_path', path)
+        object.__setattr__(self, '_children', {})
+
+    def __getattr__(self, name: str) -> Any:
+        # __getattr__ runs only when normal lookup fails, so _path/_children
+        # (set in __init__) and methods are never routed here.
+        children = object.__getattribute__(self, '_children')
+        if name in children:
+            return children[name]
+        label = object.__getattribute__(self, '_path') or '<rpc>'
+        raise AttributeError(f"'{label}' namespace has no attribute '{name}'")
+
+    def __dir__(self) -> list[str]:
+        return sorted(object.__getattribute__(self, '_children').keys())
+
+    def __repr__(self) -> str:
+        children = object.__getattribute__(self, '_children')
+        label = object.__getattribute__(self, '_path') or '<rpc>'
+        return f'<ToolNamespace {label}: {", ".join(sorted(children))}>'
+
+
 # ---------------------------------------------------------------------------
 # RPCNamespace
 # ---------------------------------------------------------------------------
 
 
 class RPCNamespace:
-    """The 'rpc' namespace object injected into scripting globals.
+    """Internal discovery-state holder for RPC callback functions.
 
-    Provides discovery (available, help), testing (mock, is_available),
-    and attribute-based function access (rpc.search_web(...)).
+    Holds the discovered FunctionDefinitions (``_definitions``) and the
+    availability gate (``is_available()``) consulted by the server when
+    building per-execution script globals. It is NOT injected into the
+    scripting environment — callback functions are projected into nested
+    ToolNamespace objects / flat globals by ``server._build_rpc_globals``.
+    The ``available()``/``help()`` helpers remain for introspection. There is
+    no script-facing ``mock()`` method; tests inject mock handlers directly via
+    the ``_mocks`` dict.
     """
 
     def __init__(self) -> None:
@@ -143,7 +232,8 @@ class RPCNamespace:
         required = set(defn.inputSchema.get('required', []))
         for param_name in defn.parameterOrder:
             prop = props.get(param_name, {})
-            ptype = prop.get('type', 'any')
+            _pt = prop.get('type', 'any')
+            ptype = ' | '.join(_pt) if isinstance(_pt, list) else _pt
             desc = prop.get('description', '')
             default = prop.get('default')
             req_str = (
@@ -155,10 +245,6 @@ class RPCNamespace:
 
         if defn.returnDescription:
             print(f'Returns: {defn.returnDescription}')
-
-    def mock(self, name: str, handler: Any) -> None:
-        """Register a mock handler that bypasses the real RPC call for *name*."""
-        self._mocks[name] = handler
 
     def is_available(self) -> bool:
         """Return True if RPC callbacks are currently active."""
@@ -206,7 +292,7 @@ def _build_docstring(defn: FunctionDefinition, default_timeout: float) -> str:
     required = set(defn.inputSchema.get('required', []))
     for param_name in defn.parameterOrder:
         prop = props.get(param_name, {})
-        ptype = _TYPE_MAP.get(prop.get('type', ''), 'Any')
+        ptype = _schema_type_to_str(prop.get('type', ''))
         desc = prop.get('description', '')
         if param_name in required:
             lines.append(f'    {param_name} ({ptype}): {desc}')
@@ -242,7 +328,7 @@ def generate_callback_function(
     The returned function:
     - Accepts positional and keyword arguments per *defn.parameterOrder*
     - Checks the validity token (raises RuntimeError if scope expired)
-    - Honours mock overrides registered via rpc_namespace.mock()
+    - Honours mock overrides injected into rpc_namespace._mocks (test-only)
     - Fills optional parameter defaults when callers omit them
     - Accepts a keyword-only _rpc_timeout argument for per-call timeout override
     - Delegates to rpc_caller(name, arguments, timeout) for the actual RPC call

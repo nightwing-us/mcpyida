@@ -10,7 +10,7 @@ Usage:
 Prints JSON readiness signal to stdout when the server is ready:
     {"status": "ready", "host": "127.0.0.1", "port": 6150, "binary": "/path/to/elf"}
 
-This is the contract that test harnesses and wingman CLI rely on.
+This is the contract that test harnesses and MCP client CLI rely on.
 
 Requires idapro pip package (idalib).
 """

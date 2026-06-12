@@ -29,6 +29,62 @@ from mcpyida.models import ScriptResult
 _script_lock = threading.Lock()
 _persistent_globals: dict | None = None
 
+# ---------------------------------------------------------------------------
+# REPL faux-namespace imports
+# ---------------------------------------------------------------------------
+#
+# Inside an idapython script, agents naturally write `import mcp`,
+# `import mcp.ghidra1 as g`, `from mcp.ghidra1 import tool` for the projected
+# namespaces. Import resolves through __builtins__.__import__, not the script
+# globals, so we install a script-scoped __import__ (in _add_extras) that
+# resolves faux namespace roots against the injected tree and defers everything
+# else (os, json, ida_*) to the real importer. It's gated to script execution
+# by _active_import_roots and is never process-wide.
+
+import builtins as _builtins  # noqa: E402
+
+from mcpyida.rpc_callbacks import ToolNamespace  # noqa: E402
+
+_real_import = _builtins.__import__
+_active_import_roots: 'dict[str, Any] | None' = None
+
+
+def _repl_import(
+    name: str,
+    globals: 'dict | None' = None,
+    locals: 'dict | None' = None,
+    fromlist: tuple = (),
+    level: int = 0,
+) -> Any:
+    """Script-scoped ``__import__`` that makes faux namespaces importable.
+
+    ``import mcp``, ``import mcp.ghidra1 as g`` and ``from mcp.ghidra1 import
+    tool`` (and the same for any other projected top-level namespace) resolve
+    against the injected namespace tree. Everything else defers to the real
+    importer. Active only while a script runs (``_active_import_roots`` set);
+    relative imports (level>0) always defer.
+
+    Real-module shadowing is prevented upstream — server._build_rpc_globals
+    escapes any projected top-level that names an importable module (e.g.
+    ``os__foo`` → ``_os.foo``), so a real module name never appears here.
+    """
+    roots = _active_import_roots
+    if roots is not None and level == 0:
+        top = name.split('.', 1)[0]
+        node = roots.get(top)
+        if isinstance(node, ToolNamespace):
+            ok = True
+            for part in name.split('.')[1:]:
+                try:
+                    node = getattr(node, part)
+                except AttributeError:
+                    ok = False
+                    break
+            if ok:
+                # `from a.b import x` -> deepest node; `import a.b` -> top (a).
+                return node if fromlist else roots[top]
+    return _real_import(name, globals, locals, fromlist, level)
+
 
 async def idapython_eval(
     code: str,
@@ -68,7 +124,7 @@ def _idapython_eval_sync(
     event_loop: 'asyncio.AbstractEventLoop | None' = None,
 ) -> ScriptResult:
     """Sync implementation — runs on IDA main thread."""
-    global _persistent_globals
+    global _persistent_globals, _active_import_roots
 
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
@@ -81,30 +137,64 @@ def _idapython_eval_sync(
         sys.stdout = _TeeStream(stdout_buf, shared_buf)  # type: ignore[assignment]
         sys.stderr = _TeeStream(stderr_buf, shared_buf)  # type: ignore[assignment]
 
-        with _script_lock:
+        # idapython is single-flight: one script at a time against the shared
+        # persistent namespace. Acquire WITHOUT blocking so a re-entrant
+        # invocation — a script that called a client tool (mcp.<server>.*) that
+        # calls back into idapython — fails fast with a clear error instead of
+        # blocking on the lock until the reverse-RPC callback times out (~30s)
+        # and wedging idapython for that window. An overlapping concurrent call
+        # likewise gets a retryable error rather than racing on shared state.
+        if not _script_lock.acquire(blocking=False):
+            return ScriptResult(
+                result=None,
+                stdout=stdout_buf.getvalue(),
+                stderr=stderr_buf.getvalue(),
+                output=shared_buf.getvalue(),
+                success=False,
+                error=(
+                    'idapython is already executing and cannot be invoked '
+                    're-entrantly or concurrently: the scripting session has a '
+                    'single shared persistent namespace and runs one script at '
+                    'a time. This typically happens when a script calls a client '
+                    'tool (mcp.<server>.*) that calls back into idapython. Retry '
+                    'after the current execution completes.'
+                ),
+            )
+        try:
             if reset or _persistent_globals is None:
                 import __main__
 
                 _persistent_globals = dict(__main__.__dict__)
                 _add_extras(_persistent_globals)
 
-            # Inject RPC callback globals for this execution.
+            # Always project this server's own tools as mcp.self.* (in-process).
+            # Reverse-RPC callbacks (mcp.<other>.*) merge into the same mcp root
+            # when the client supports mcpy/rpcCallbacks.
+            from mcpyida.server import _build_self_globals, _build_rpc_globals
+
             scope = None
-            rpc_globals: dict[str, Any] = {}
+            injected_globals: dict[str, Any] = _build_self_globals()
             if rpc_namespace is not None and rpc_namespace.is_available():
-                from mcpyida.server import _build_rpc_globals
                 from mcpyida.rpc_callbacks import CallbackScope
 
                 scope = CallbackScope()
-                rpc_globals = _build_rpc_globals(
-                    rpc_namespace, session, scope, _persistent_globals, event_loop
+                _build_rpc_globals(
+                    rpc_namespace,
+                    session,
+                    scope,
+                    _persistent_globals,
+                    event_loop,
+                    roots=injected_globals,
                 )
-                _persistent_globals.update(rpc_globals)
+            _persistent_globals.update(injected_globals)
 
             # Mark script execution active for snapshot isolation.
             import mcpyida.server as _srv
 
             _srv._script_executing = True
+
+            # Activate REPL faux-namespace import resolution for this execution.
+            _active_import_roots = injected_globals
 
             try:
                 if not code.strip():
@@ -137,6 +227,8 @@ def _idapython_eval_sync(
                 )
 
             finally:
+                # Deactivate faux-namespace import resolution.
+                _active_import_roots = None
                 # Clear execution flag and apply any deferred function-list update.
                 _srv._script_executing = False
                 if _srv._rpc_update_deferred:
@@ -144,11 +236,14 @@ def _idapython_eval_sync(
                     _srv._rpc_functions_discovered = False
 
                 # Always invalidate the callback scope after execution completes,
-                # and remove all injected RPC globals to prevent stale references.
+                # and remove all injected globals (mcp.self.* and reverse-RPC) to
+                # prevent stale references.
                 if scope is not None:
                     scope.invalidate()
-                for key in rpc_globals:
+                for key in injected_globals:
                     _persistent_globals.pop(key, None)
+        finally:
+            _script_lock.release()
 
     except Exception as e:
         return ScriptResult(
@@ -184,8 +279,13 @@ class _TeeStream:
 
 def _add_extras(g: dict) -> None:
     """Add extra modules to globals that may not be in __main__."""
-    # Ensure builtins are available
-    g.setdefault('__builtins__', __builtins__)
+    # Install a script-scoped __builtins__ whose __import__ resolves faux
+    # namespaces (mcp.*, etc.) — see _repl_import. A copy of the real builtins
+    # with only __import__ overridden; gated to script execution by
+    # _active_import_roots, so it behaves as the real importer otherwise.
+    script_builtins = dict(vars(_builtins))
+    script_builtins['__import__'] = _repl_import
+    g['__builtins__'] = script_builtins
 
     # Lazy-import additional ida_* modules that may not be in __main__
     def _lazy(module_name: str) -> object:

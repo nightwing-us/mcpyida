@@ -58,7 +58,6 @@ tests/fixtures/*.id2
 tests/fixtures/*.nam
 tests/fixtures/*.til
 tests/fixtures/*.i64
-.wing/
 tasks.py
 
 # Local Claude workspace

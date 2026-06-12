@@ -494,27 +494,44 @@ class TestRpcCallbacks:
 
         anyio.run(_test)
 
-    def test_rpc_namespace_available(self, headless_server: dict) -> None:
-        """rpc.available() returns the list of discovered function names."""
+    def test_nested_namespace_projection(self, headless_server: dict) -> None:
+        """A '__'-separated function name projects into nested namespaces."""
 
         async def _test() -> None:
-            data = await _call_with_rpc(headless_server, 'rpc.available()')
-            assert data['success'] is True, f"Script failed: {data.get('error')}"
-            # result is the str() of the list, e.g. "['test_add']"
-            assert 'test_add' in data['result'], (
-                f"Expected 'test_add' in rpc.available(), got {data['result']!r}"
+            functions = [
+                FunctionDefinition(
+                    name='mcp__svc__test_add',
+                    description='Add two integers and return the sum',
+                    parameterOrder=['a', 'b'],
+                    inputSchema={
+                        'type': 'object',
+                        'properties': {
+                            'a': {'type': 'integer', 'description': 'First operand'},
+                            'b': {'type': 'integer', 'description': 'Second operand'},
+                        },
+                        'required': ['a', 'b'],
+                    },
+                    returnDescription='Sum of a and b',
+                ),
+            ]
+
+            async def _handler(params: dict) -> CallFunctionResult:
+                # The server calls back with the ORIGINAL (raw) function name.
+                args = params.get('arguments') or {}
+                if params.get('name') == 'mcp__svc__test_add':
+                    return CallFunctionResult(content=args['a'] + args['b'])
+                raise ValueError(f"Unknown function: {params.get('name')}")
+
+            data = await _call_with_rpc(
+                headless_server,
+                'mcp.svc.test_add(8, 9)',
+                functions=functions,
+                call_handler=_handler,
             )
-
-        anyio.run(_test)
-
-    def test_rpc_is_available(self, headless_server: dict) -> None:
-        """rpc.is_available() returns True when mcpy/rpcCallbacks is active."""
-
-        async def _test() -> None:
-            data = await _call_with_rpc(headless_server, 'rpc.is_available()')
             assert data['success'] is True, f"Script failed: {data.get('error')}"
-            assert data['result'] == 'True', (
-                f"Expected rpc.is_available() == True, got {data['result']!r}"
+            assert data['result'] == '17', (
+                f"Expected result='17', got {data['result']!r}.\n"
+                f"stdout={data.get('stdout')!r}\nstderr={data.get('stderr')!r}"
             )
 
         anyio.run(_test)

@@ -102,7 +102,7 @@ Each function in the `functions` array contains:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Unique function identifier. **MUST** be a valid Python identifier. **MUST NOT** shadow Python builtins, keywords, or existing scripting globals. |
+| `name` | string | Yes | Unique function identifier. Projected into the scripting environment via the Namespace Projection rules below (`__` separators become nested namespaces; reserved-word and shadowing collisions are escaped with a leading underscore). |
 | `description` | string | No | Human-readable description of the function's purpose. |
 | `parameterOrder` | array of string | Yes | Ordered list of parameter names defining positional argument order. **MUST** match keys in `inputSchema.properties`. |
 | `inputSchema` | object | Yes | JSON Schema object (type: "object") defining the function's parameters and their types. Properties listed in `required` are mandatory; others are optional. |
@@ -218,10 +218,45 @@ When raising exceptions in the scripting environment from a remote error respons
 
 ## Scripting Integration
 
-MCPyIDA injects callback functions into the scripting environment of the `idapython` tool as:
+MCPyIDA injects callback functions into the scripting environment of the `idapython` tool by **namespace projection** (see "Namespace Projection" below):
 
-1. **Global functions** — available directly by name: `search_web("query")`
-2. **Namespace object** — available as attributes: `rpc.search_web("query")` with methods like `rpc.available()` for discovery and `rpc.help("search_web")` for documentation.
+1. **Flat globals** — a name with no `__` separator is injected directly by name: `search_web("query")`.
+2. **Nested namespaces** — a name with `__` separators is projected into nested namespace objects: `mcp__ghidra1__list` becomes `mcp.ghidra1.list("...")`.
+
+Discovery and documentation use native Python introspection — `dir(mcp.ghidra1)` lists the available calls and `help(mcp.ghidra1.list)` prints the generated signature and docstring. (Earlier revisions injected a dedicated `rpc` helper object; that is no longer provided.)
+
+### Namespace Projection
+
+Function names are projected into the scripting environment by splitting on `__`:
+
+- **Separators are greedy.** A run of two or more underscores is a single
+  separator: `mcp___ghidra1` → `mcp.ghidra1`. Leading, trailing, and repeated
+  separators collapse (`__mcp__ghidra1__list__` → `mcp.ghidra1.list`). A single
+  underscore is preserved within a segment (`search_web` stays one name).
+- **No separator → flat global.** `search_web` is injected directly by name.
+- **A name with no usable segments is skipped.** If a name is entirely
+  underscores (e.g. `____`), it yields no segments and the function is skipped
+  and logged.
+- **Reserved words are escaped, not dropped.** A segment that is a Python hard
+  keyword (e.g. `import`, `class`) is prefixed with `_` so it stays reachable
+  via dotted access (`mcp.import` is a `SyntaxError`; `mcp._import` is valid).
+  Builtins (`list`, `type`) and soft keywords (`match`, `case`) are valid
+  attribute names, so they are left unescaped as sub/leaf segments. (As the
+  top-level global, soft keywords and builtins are still escaped — see
+  top-level shadowing below.)
+- **Top-level shadowing is escaped.** Only the first segment becomes a real
+  global. If it would shadow an existing scripting global, a builtin, or a
+  keyword, it is prefixed with `_` (`list` → `_list`, `list__foo` →
+  `_list.foo`). If the escaped name also collides, the function is skipped and
+  logged.
+- **Leaf-vs-namespace conflicts are skipped deterministically.** If one name
+  needs a path as a callable and another needs the same path as a namespace
+  (e.g. `mcp__ghidra1` and `mcp__ghidra1__list`), functions are processed in
+  sorted name order and the first claim wins; the conflicting function is
+  skipped and logged.
+
+Projection affects only how functions are *named* in the scripting environment.
+The wire protocol (`mcpy/callFunction`) always uses the original function name.
 
 ### Generating Function Signatures
 
@@ -282,13 +317,19 @@ The `CallbackScope` is invalidated at the end of `_idapython_eval_sync()` (see `
 
 ## Name Collision Protection
 
-Function names declared in `mcpy/listFunctions` **MUST NOT** shadow:
+Function names are projected into the scripting environment by the Namespace
+Projection rules above, which resolve collisions by escaping rather than by
+forbidding names:
 
-- Python builtins (e.g., `list`, `print`, `open`, `type`, `id`, `input`, `format`, `vars`)
-- Python keywords (e.g., `for`, `if`, `class`, `import`, `return`, and soft keywords like `match`)
-- Existing scripting globals defined by MCPyIDA (e.g., `idaapi`, `idc`, `idautils`, `IdaFunction`)
+- A top-level name that would shadow a Python builtin, a keyword (including soft
+  keywords like `match`), or an existing scripting global (e.g. `idaapi`, `idc`,
+  `idautils`, `IdaFunction`) is escaped with a leading underscore.
+- Hard-keyword path segments at any level are escaped with a leading underscore.
+- A function whose escaped top-level name still collides, or whose path conflicts
+  with an already-claimed namespace/callable, is skipped and logged.
 
-Servers **MUST** maintain a denylist of reserved names (via `_PYTHON_DENYLIST` in `src/mcpyida/rpc_callbacks.py:75-77`) and reject or skip any function whose name collides. Rejected functions are logged at DEBUG level (see `src/mcpyida/server.py:456`).
+The reserved-name denylist used for top-level safety is `_PYTHON_DENYLIST` in
+`src/mcpyida/rpc_callbacks.py`.
 
 ## Re-Entrancy & Recursion Limits
 

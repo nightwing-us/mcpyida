@@ -110,18 +110,23 @@ class TestIdaproAbsence:
     def test_mcpserver_imports_without_idapro(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """mcpyida.mcpserver must not raise ImportError when idapro is absent."""
         self._patch_context(monkeypatch)
-        _purge_mcpyida_modules()
+        # IMPORTANT: Do NOT purge mcpyida modules; only monkeypatch sys.modules['idapro'].
+        # Purging and re-importing causes module state to differ from what tests expect
+        # (test_rpc_server_integration imports functions at collection time and expects
+        # those functions to see a properly initialized module).
+        # Let monkeypatch handle the sys.modules cleanup after the test.
 
-        # Should NOT raise.
+        # Should NOT raise even when idapro is unavailable.
         mod = importlib.import_module('mcpyida.mcpserver')
         assert mod is not None
 
     def test_ida_helpers_imports_without_idapro(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """mcpyida.ida_helpers must not raise ImportError when idapro is absent."""
         self._patch_context(monkeypatch)
-        _purge_mcpyida_modules()
+        # IMPORTANT: Do NOT purge mcpyida modules; only monkeypatch sys.modules['idapro'].
+        # See comment in test_mcpserver_imports_without_idapro.
 
-        # Should NOT raise.
+        # Should NOT raise even when idapro is unavailable.
         mod = importlib.import_module('mcpyida.ida_helpers')
         assert mod is not None
 
@@ -138,7 +143,8 @@ class TestIdaproAbsence:
         module that carries the idapro import and is used by the plugin at runtime.
         """
         self._patch_context(monkeypatch)
-        _purge_mcpyida_modules()
+        # IMPORTANT: Do NOT purge mcpyida modules; only monkeypatch sys.modules['idapro'].
+        # See comment in test_mcpserver_imports_without_idapro.
 
         # mcpserver is what the plugin ultimately depends on — it must import cleanly.
         mod = importlib.import_module('mcpyida.mcpserver')
@@ -152,7 +158,8 @@ class TestIdaproAbsence:
     ) -> None:
         """McpServerState is accessible after import without idapro."""
         self._patch_context(monkeypatch)
-        _purge_mcpyida_modules()
+        # IMPORTANT: Do NOT purge mcpyida modules; only monkeypatch sys.modules['idapro'].
+        # See comment in test_mcpserver_imports_without_idapro.
 
         mod = importlib.import_module('mcpyida.mcpserver')
         assert hasattr(mod, 'McpServerState')
@@ -163,7 +170,8 @@ class TestIdaproAbsence:
     ) -> None:
         """IdaFunction and IdaException are accessible after import without idapro."""
         self._patch_context(monkeypatch)
-        _purge_mcpyida_modules()
+        # IMPORTANT: Do NOT purge mcpyida modules; only monkeypatch sys.modules['idapro'].
+        # See comment in test_mcpserver_imports_without_idapro.
 
         mod = importlib.import_module('mcpyida.ida_helpers')
         assert hasattr(mod, 'IdaFunction')

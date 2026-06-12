@@ -1,6 +1,6 @@
 """E2E test: prove that MCPyIDA headless launch works.
 
-This test IS the contract for wingman integration.
+This test IS the contract for MCP client integration.
 """
 import anyio
 import pytest

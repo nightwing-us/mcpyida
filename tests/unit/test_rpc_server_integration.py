@@ -6,7 +6,7 @@ and transport interactions are mocked at the Python level.
 Test classes:
 - TestSendCustomRequest    — low-level JSON-RPC helper constructs valid request
 - TestDiscoverRpcFunctions — caching, no-capability path, listFunctions parsing
-- TestBuildRpcGlobals      — namespace injection, name collision, rpc key
+- TestBuildRpcGlobals      — nested namespace projection, name collision, no rpc key
 - TestScriptingIntegration — scope created/invalidated, globals injected per exec
 - TestDeclareRpcCapability — experimental capabilities patched on low-level server
 - TestMakeSyncCallerIda    — IDA-specific: work queue pump, timeout, scope checks
@@ -38,6 +38,7 @@ from mcpyida.rpc_callbacks import (
     RPCError,
     RPCNamespace,
     RPCTimeoutError,
+    ToolNamespace,
     generate_callback_function,
 )
 from mcpyida.rpc_types import (
@@ -48,8 +49,10 @@ from mcpyida.rpc_types import (
 )
 from mcpyida.server import (
     _build_rpc_globals,
+    _build_self_globals,
     _declare_rpc_capability,
     _discover_rpc_functions,
+    _install_rpc_path,
     _make_sync_caller_ida,
     _on_functions_changed,
     _reset_rpc_discovery,
@@ -587,7 +590,7 @@ class TestDiscoverRpcFunctions:
 # ---------------------------------------------------------------------------
 
 class TestBuildRpcGlobals:
-    """Tests for _build_rpc_globals — per-execution globals injection."""
+    """Tests for _build_rpc_globals — per-execution nested projection."""
 
     def _make_ns(self, names: list[str] | None = None) -> RPCNamespace:
         return _make_populated_namespace(names)
@@ -595,26 +598,105 @@ class TestBuildRpcGlobals:
     def _make_loop(self) -> MagicMock:
         return MagicMock(spec=asyncio.AbstractEventLoop)
 
-    def test_rpc_key_always_present(self):
-        """'rpc' key is always injected even when all functions have name collisions."""
+    def _ns_with_names(self, names: list[str]) -> RPCNamespace:
+        """Build an RPCNamespace whose _definitions hold the given raw names."""
+        ns = RPCNamespace()
+        definitions: dict[str, FunctionDefinition] = {n: _make_defn(n) for n in names}
+        ns.update_functions({}, definitions)
+        return ns
+
+    def test_no_rpc_global_injected(self):
         ns = self._make_ns(['search_web'])
         scope = CallbackScope()
         injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
-        assert 'rpc' in injected
+        assert 'rpc' not in injected
 
-    def test_rpc_value_is_rpc_namespace(self):
-        ns = self._make_ns(['search_web'])
-        scope = CallbackScope()
-        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
-        assert isinstance(injected['rpc'], RPCNamespace)
-
-    def test_function_globals_injected(self):
-        """Callback function names are injected as top-level globals."""
+    def test_flat_name_injected_as_global(self):
         ns = self._make_ns(['search_web', 'ask_llm'])
         scope = CallbackScope()
         injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
-        assert 'search_web' in injected
-        assert 'ask_llm' in injected
+        assert callable(injected['search_web'])
+        assert callable(injected['ask_llm'])
+
+    def test_nested_name_projected(self):
+        ns = self._ns_with_names(['mcp__ghidra1__list'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert isinstance(injected['mcp'], ToolNamespace)
+        assert isinstance(injected['mcp'].ghidra1, ToolNamespace)
+        assert callable(injected['mcp'].ghidra1.list)
+
+    def test_projected_callable_name_is_dotted_for_help(self):
+        # help()/pydoc keys off __name__; projected tools should read as the
+        # dotted path (mcp.ghidra1.list), not the raw mcp__ghidra1__list.
+        ns = self._ns_with_names(['mcp__ghidra1__list'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        fn = injected['mcp'].ghidra1.list
+        assert fn.__name__ == 'mcp.ghidra1.list'
+        assert fn.__qualname__ == 'mcp.ghidra1.list'
+
+    def test_flat_callable_name_unchanged(self):
+        ns = self._make_ns(['search_web'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert injected['search_web'].__name__ == 'search_web'
+
+    def test_multiple_under_same_root(self):
+        ns = self._ns_with_names(['mcp__a__x', 'mcp__b__y'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert set(injected.keys()) == {'mcp'}
+        assert callable(injected['mcp'].a.x)
+        assert callable(injected['mcp'].b.y)
+
+    def test_top_level_shadow_escaped(self):
+        ns = self._make_ns(['search_web', 'ask_llm'])
+        scope = CallbackScope()
+        existing = {'search_web': 'already_here'}
+        injected = _build_rpc_globals(ns, None, scope, existing, self._make_loop())
+        assert 'search_web' not in injected
+        assert callable(injected['_search_web'])
+        assert callable(injected['ask_llm'])
+
+    def test_top_level_builtin_shadow_escaped(self):
+        # a top-level segment that is a Python builtin (not an existing global)
+        # is still escaped: list__foo -> _list.foo
+        ns = self._ns_with_names(['list__foo'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert 'list' not in injected
+        assert callable(injected['_list'].foo)
+
+    def test_top_level_shadow_escape_also_collides_skipped(self):
+        # both 'search_web' and the escaped '_search_web' already exist -> skip
+        ns = self._make_ns(['search_web', 'ask_llm'])
+        scope = CallbackScope()
+        existing = {'search_web': 'x', '_search_web': 'y'}
+        injected = _build_rpc_globals(ns, None, scope, existing, self._make_loop())
+        assert 'search_web' not in injected
+        assert '_search_web' not in injected
+        assert callable(injected['ask_llm'])
+
+    def test_hard_keyword_segment_escaped(self):
+        ns = self._ns_with_names(['mcp__import__x'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert callable(injected['mcp']._import.x)
+
+    def test_leaf_vs_namespace_conflict_skipped(self):
+        # sorted order: 'mcp__ghidra1' < 'mcp__ghidra1__list' -> leaf wins
+        ns = self._ns_with_names(['mcp__ghidra1', 'mcp__ghidra1__list'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert callable(injected['mcp'].ghidra1)
+        assert not isinstance(injected['mcp'].ghidra1, ToolNamespace)
+
+    def test_all_underscore_name_skipped(self):
+        ns = self._ns_with_names(['____'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert injected == {}
 
     def test_injected_functions_are_callable(self):
         ns = self._make_ns(['search_web'])
@@ -622,25 +704,7 @@ class TestBuildRpcGlobals:
         injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
         assert callable(injected['search_web'])
 
-    def test_name_collision_with_existing_globals_skipped(self):
-        """Functions whose names collide with existing script globals are not injected."""
-        ns = self._make_ns(['search_web', 'ask_llm'])
-        scope = CallbackScope()
-        existing = {'search_web': 'already_here'}
-        injected = _build_rpc_globals(ns, None, scope, existing, self._make_loop())
-        assert 'search_web' not in injected
-        assert 'ask_llm' in injected
-
-    def test_injected_functions_share_exec_namespace(self):
-        """The 'rpc' namespace and individual globals come from the same RPCNamespace."""
-        ns = self._make_ns(['search_web'])
-        scope = CallbackScope()
-        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
-        rpc_ns = injected['rpc']
-        assert 'search_web' in rpc_ns._functions
-
     def test_scope_invalidation_expires_injected_functions(self):
-        """Injected callback functions raise RuntimeError after scope invalidation."""
         ns = self._make_ns(['search_web'])
         scope = CallbackScope()
         injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
@@ -649,20 +713,12 @@ class TestBuildRpcGlobals:
         with pytest.raises(RuntimeError, match='Callback expired'):
             fn('hello')
 
-    def test_empty_namespace_returns_only_rpc_key(self):
-        """Empty RPCNamespace yields only the 'rpc' global."""
+    def test_empty_namespace_returns_empty(self):
         ns = RPCNamespace()
         ns.update_functions({}, {})
         scope = CallbackScope()
         injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
-        assert set(injected.keys()) == {'rpc'}
-
-    def test_rpc_namespace_in_injected_is_available(self):
-        """The injected 'rpc' namespace reports is_available() == True."""
-        ns = self._make_ns(['search_web'])
-        scope = CallbackScope()
-        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
-        assert injected['rpc'].is_available() is True
+        assert injected == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1063,15 +1119,16 @@ class TestScriptingIntegration:
 
         captured_scopes: list[CallbackScope] = []
 
-        def _capture_scope(*args, **kwargs):
+        def _capture_scope(*args, roots=None, **kwargs):
             scope = kwargs.get('scope') or args[2]
             captured_scopes.append(scope)
-            return {'rpc': RPCNamespace()}
+            # Mirror the real contract: merge into roots when provided.
+            if roots is not None:
+                roots['rpc_mock'] = RPCNamespace()
 
         ns = self._make_ns(['search_web'])
 
         # Pre-seed persistent_globals so the __main__ import path is skipped.
-        import sys
         saved = scripting_mod._persistent_globals
         scripting_mod._persistent_globals = {'__builtins__': __builtins__}
         try:
@@ -1090,10 +1147,11 @@ class TestScriptingIntegration:
 
         captured_scopes: list[CallbackScope] = []
 
-        def _capture_scope(*args, **kwargs):
+        def _capture_scope(*args, roots=None, **kwargs):
             scope = kwargs.get('scope') or args[2]
             captured_scopes.append(scope)
-            return {'rpc': RPCNamespace()}
+            if roots is not None:
+                roots['rpc_mock'] = RPCNamespace()
 
         ns = self._make_ns(['search_web'])
 
@@ -1144,41 +1202,17 @@ class TestScriptingIntegration:
             scripting_mod._persistent_globals = saved
 
     def test_rpc_globals_cleaned_up_after_execution(self):
-        """RPC globals injected during execution are removed from _persistent_globals."""
-        from mcpyida.tools.scripting import _idapython_eval_sync
-        import mcpyida.tools.scripting as scripting_mod
-
-        ns = self._make_ns(['my_callback'])
-        injected_globals: dict[str, Any] = {}
-
-        def _fake_build_globals(namespace, session, scope, existing, event_loop=None):
-            injected_globals['rpc'] = RPCNamespace()
-            injected_globals['my_callback'] = lambda: 'ok'
-            return injected_globals
-
-        saved = scripting_mod._persistent_globals
-        scripting_mod._persistent_globals = {'__builtins__': __builtins__}
-        try:
-            with patch('mcpyida.server._build_rpc_globals', side_effect=_fake_build_globals):
-                _idapython_eval_sync('1', rpc_namespace=ns, event_loop=self._make_loop())
-        finally:
-            pg = scripting_mod._persistent_globals
-            scripting_mod._persistent_globals = saved
-
-        # After execution, persistent_globals should not contain injected keys.
-        if pg is not None:
-            assert 'my_callback' not in pg
-            assert 'rpc' not in pg
-
-    def test_rpc_globals_injected_during_execution(self):
-        """_build_rpc_globals result is merged into _persistent_globals during exec."""
+        """All injected globals (mcp.self.* and reverse-RPC additions) are removed after exec."""
         from mcpyida.tools.scripting import _idapython_eval_sync
         import mcpyida.tools.scripting as scripting_mod
 
         ns = self._make_ns(['my_callback'])
 
-        def _fake_build_globals(namespace, session, scope, existing, event_loop=None):
-            return {'rpc': RPCNamespace(), 'my_callback': lambda: 'ok'}
+        def _fake_build_globals(namespace, session, scope, existing, event_loop=None,
+                                roots=None):
+            # Simulate reverse-RPC adding a top-level key into roots.
+            if roots is not None:
+                roots['my_callback'] = lambda: 'ok'
 
         saved = scripting_mod._persistent_globals
         scripting_mod._persistent_globals = {'__builtins__': __builtins__}
@@ -1186,9 +1220,56 @@ class TestScriptingIntegration:
             with patch('mcpyida.server._build_rpc_globals', side_effect=_fake_build_globals):
                 result = _idapython_eval_sync('1', rpc_namespace=ns, event_loop=self._make_loop())
         finally:
+            pg = scripting_mod._persistent_globals
             scripting_mod._persistent_globals = saved
 
         assert result.success is True
+        # After execution, both the mcp.self.* root and any reverse-RPC additions are gone.
+        assert pg is not None
+        assert 'my_callback' not in pg
+        assert 'mcp' not in pg
+
+    def test_rpc_globals_injected_during_execution(self):
+        """mcp.self.* and reverse-RPC additions are visible in _persistent_globals during exec."""
+        from mcpyida.tools.scripting import _idapython_eval_sync
+        from mcpyida.rpc_callbacks import ToolNamespace
+        import mcpyida.tools.scripting as scripting_mod
+
+        ns = self._make_ns(['my_callback'])
+        observed_during: dict[str, Any] = {}
+
+        def _fake_build_globals(namespace, session, scope, existing, event_loop=None,
+                                roots=None):
+            # Simulate reverse-RPC adding an entry into the shared roots dict.
+            if roots is not None:
+                roots['my_callback'] = lambda: 'ok'
+
+        def _spy_eval_ast(tree, code, exec_globals):
+            # Capture what's present during execution.
+            observed_during.update({
+                'has_mcp': 'mcp' in exec_globals,
+                'mcp_has_self': isinstance(exec_globals.get('mcp'), ToolNamespace)
+                    and hasattr(exec_globals['mcp'], 'self'),
+                'has_my_callback': 'my_callback' in exec_globals,
+            })
+            return None
+
+        saved = scripting_mod._persistent_globals
+        scripting_mod._persistent_globals = {'__builtins__': __builtins__}
+        try:
+            with patch('mcpyida.server._build_rpc_globals', side_effect=_fake_build_globals):
+                with patch('mcpyida.tools.scripting._eval_ast', side_effect=_spy_eval_ast):
+                    result = _idapython_eval_sync('x = 1', rpc_namespace=ns,
+                                                  event_loop=self._make_loop())
+        finally:
+            scripting_mod._persistent_globals = saved
+
+        assert result.success is True
+        # mcp.self.* always injected.
+        assert observed_during['has_mcp'] is True
+        assert observed_during['mcp_has_self'] is True
+        # Reverse-RPC addition also visible during execution.
+        assert observed_during['has_my_callback'] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1444,3 +1525,461 @@ class TestSnapshotIsolation:
 
         assert srv._rpc_update_deferred is False
         assert srv._script_executing is False
+
+
+# ---------------------------------------------------------------------------
+# TestInstallRpcPath
+# ---------------------------------------------------------------------------
+
+class TestInstallRpcPath:
+    """Tests for _install_rpc_path — pure nested-tree insertion."""
+
+    def _fn(self, tag: str):
+        return lambda: tag
+
+    def test_single_segment_is_flat_root(self):
+        roots: dict = {}
+        assert _install_rpc_path(roots, ['search_web'], self._fn('a')) is True
+        assert callable(roots['search_web'])
+
+    def test_nested_path_builds_namespaces(self):
+        roots: dict = {}
+        assert _install_rpc_path(roots, ['mcp', 'ghidra1', 'list'], self._fn('a')) is True
+        assert isinstance(roots['mcp'], ToolNamespace)
+        assert isinstance(roots['mcp'].ghidra1, ToolNamespace)
+        assert roots['mcp'].ghidra1.list() == 'a'
+
+    def test_multiple_paths_share_root(self):
+        roots: dict = {}
+        _install_rpc_path(roots, ['mcp', 'a', 'x'], self._fn('x'))
+        _install_rpc_path(roots, ['mcp', 'b', 'y'], self._fn('y'))
+        assert set(roots.keys()) == {'mcp'}
+        assert roots['mcp'].a.x() == 'x'
+        assert roots['mcp'].b.y() == 'y'
+
+    def test_leaf_then_namespace_conflict_returns_false(self):
+        roots: dict = {}
+        assert _install_rpc_path(roots, ['mcp', 'ghidra1'], self._fn('leaf')) is True
+        # 'mcp.ghidra1' is now a callable — nesting under it must fail
+        assert _install_rpc_path(roots, ['mcp', 'ghidra1', 'list'], self._fn('x')) is False
+        assert callable(roots['mcp'].ghidra1)
+
+    def test_namespace_then_leaf_conflict_returns_false(self):
+        roots: dict = {}
+        assert _install_rpc_path(roots, ['mcp', 'ghidra1', 'list'], self._fn('x')) is True
+        # 'mcp.ghidra1' is now a namespace — binding it as a leaf must fail
+        assert _install_rpc_path(roots, ['mcp', 'ghidra1'], self._fn('leaf')) is False
+        assert isinstance(roots['mcp'].ghidra1, ToolNamespace)
+
+    def test_duplicate_leaf_returns_false(self):
+        roots: dict = {}
+        assert _install_rpc_path(roots, ['mcp', 'x'], self._fn('first')) is True
+        assert _install_rpc_path(roots, ['mcp', 'x'], self._fn('second')) is False
+        assert roots['mcp'].x() == 'first'
+
+
+# ---------------------------------------------------------------------------
+# TestBuildSelfGlobals
+# ---------------------------------------------------------------------------
+
+class TestBuildSelfGlobals:
+    """Pure-structure tests for _build_self_globals (no live IDA invocation)."""
+
+    def test_returns_single_mcp_root_with_self_child(self):
+        from mcpyida.server import _build_self_globals
+        g = _build_self_globals()
+        assert set(g.keys()) == {'mcp'}
+        assert isinstance(g['mcp'], ToolNamespace)
+        assert isinstance(g['mcp'].self, ToolNamespace)
+
+    def test_excludes_idapython_code_exec_tool(self):
+        from mcpyida.server import _build_self_globals
+        selfns = _build_self_globals()['mcp'].self
+        assert 'idapython' not in dir(selfns)
+
+    def test_includes_representative_tools(self):
+        from mcpyida.server import _build_self_globals
+        selfns = _build_self_globals()['mcp'].self
+        names = dir(selfns)
+        assert 'decompile' in names
+        assert 'list' in names
+
+    def test_leaves_are_callable_with_docstrings(self):
+        from mcpyida.server import _build_self_globals
+        selfns = _build_self_globals()['mcp'].self
+        fn = selfns.decompile
+        assert callable(fn)
+        assert fn.__name__ == 'decompile'
+        assert fn.__doc__  # carried from the source method for native help()
+
+    @pytest.mark.anyio
+    async def test_drive_coro_sync_raises_when_loop_running(self):
+        """_drive_coro_sync raises RuntimeError when called inside an async context."""
+        from mcpyida.server import _drive_coro_sync
+
+        async def dummy_coro():
+            return 42
+
+        with pytest.raises(RuntimeError, match='must not be called while an event loop is running'):
+            _drive_coro_sync(dummy_coro())
+
+
+# ---------------------------------------------------------------------------
+# TestBuildRpcGlobalsRootsMerge
+# ---------------------------------------------------------------------------
+
+class TestBuildRpcGlobalsRootsMerge:
+    def _make_loop(self):
+        return MagicMock(spec=asyncio.AbstractEventLoop)
+
+    def _ns_with_names(self, names):
+        ns = RPCNamespace()
+        ns.update_functions({}, {n: _make_defn(n) for n in names})
+        return ns
+
+    def test_merges_into_provided_roots_sharing_mcp(self):
+        seed = _build_self_globals()  # {'mcp': ToolNamespace(self=...)}
+        ns = self._ns_with_names(['mcp__ghidra1__list'])
+        scope = CallbackScope()
+        out = _build_rpc_globals(ns, None, scope, {}, self._make_loop(), roots=seed)
+        assert out is seed
+        assert isinstance(out['mcp'].self, ToolNamespace)
+        assert callable(out['mcp'].ghidra1.list)
+
+    def test_none_roots_behaves_as_before(self):
+        ns = self._ns_with_names(['search_web'])
+        scope = CallbackScope()
+        out = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert 'rpc' not in out
+        assert callable(out['search_web'])
+
+    def test_self_wins_collision_with_reverse_rpc(self):
+        seed = _build_self_globals()
+        ns = self._ns_with_names(['mcp__self__evil'])
+        scope = CallbackScope()
+        out = _build_rpc_globals(ns, None, scope, {}, self._make_loop(), roots=seed)
+        assert 'evil' not in dir(out['mcp'].self)
+
+    def test_two_segment_mcp_self_also_guarded(self):
+        seed = _build_self_globals()
+        ns = self._ns_with_names(['mcp__self'])
+        scope = CallbackScope()
+        out = _build_rpc_globals(ns, None, scope, {}, self._make_loop(), roots=seed)
+        # mcp.self stays the in-process ToolNamespace (not replaced by a callable)
+        assert isinstance(out['mcp'].self, ToolNamespace)
+
+
+# ---------------------------------------------------------------------------
+# TestIdapythonReentrancyGuard — single-flight fast-fail
+# ---------------------------------------------------------------------------
+
+
+class TestIdapythonReentrancyGuard:
+    """A second idapython invocation while one is executing fast-fails (no deadlock)."""
+
+    def test_reentrant_invocation_fast_fails_with_clear_error(self):
+        import mcpyida.tools.scripting as _scripting
+        from mcpyida.tools.scripting import _idapython_eval_sync
+
+        # Simulate a script already running by holding the single-flight lock.
+        acquired = _scripting._script_lock.acquire(blocking=False)
+        assert acquired
+        try:
+            res = _idapython_eval_sync('1 + 1')
+        finally:
+            _scripting._script_lock.release()
+
+        assert res.success is False
+        assert res.error is not None
+        assert 're-entrant' in res.error and 'already executing' in res.error
+
+    def test_lock_released_after_normal_execution(self):
+        import mcpyida.tools.scripting as _scripting
+        from mcpyida.tools.scripting import _idapython_eval_sync
+
+        saved = _scripting._persistent_globals
+        _scripting._persistent_globals = {'__builtins__': __builtins__}
+        try:
+            _idapython_eval_sync('1 + 1')
+        finally:
+            _scripting._persistent_globals = saved
+
+        # The single-flight lock must be free after a normal execution.
+        got = _scripting._script_lock.acquire(blocking=False)
+        assert got
+        _scripting._script_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# TestMcpyNotificationRouting — receive-side mcpy/ notification interception
+# ---------------------------------------------------------------------------
+
+
+class TestMcpyNotificationRouting:
+    """The read-stream filter routes notifications/mcpy/* before SDK validation."""
+
+    def _msg(self, method: str):
+        from mcp.shared.message import SessionMessage
+        from mcp.types import JSONRPCMessage, JSONRPCNotification
+
+        return SessionMessage(message=JSONRPCMessage(JSONRPCNotification(jsonrpc='2.0', method=method)))
+
+    @pytest.mark.anyio
+    async def test_filter_routes_mcpy_and_passes_others(self):
+        from mcpyida.server import _McpyNotificationReadFilter
+
+        send, recv = anyio.create_memory_object_stream(10)
+        routed: list[str] = []
+        filt = _McpyNotificationReadFilter(recv, lambda m, r: routed.append(m))
+        for meth in [
+            'notifications/initialized',
+            'notifications/mcpy/functions/list_changed',
+            'notifications/mcpy/other',
+        ]:
+            await send.send(self._msg(meth))
+        await send.aclose()
+
+        seen: list[str] = []
+        async for msg in filt:
+            seen.append(msg.message.root.method)
+
+        assert seen == ['notifications/initialized']
+        assert routed == [
+            'notifications/mcpy/functions/list_changed',
+            'notifications/mcpy/other',
+        ]
+
+    @pytest.mark.anyio
+    async def test_filter_supports_async_context_manager(self):
+        """BaseSession._receive_loop does ``async with self._read_stream`` and
+        then ``async for ... in self._read_stream``. Async-CM dunders are looked
+        up on the TYPE, bypassing ``__getattr__``, so the filter MUST define
+        ``__aenter__``/``__aexit__`` on the class — otherwise the receive loop
+        raises at entry, dies, and every client call hangs waiting for a reply.
+        """
+        from mcpyida.server import _McpyNotificationReadFilter
+
+        send, recv = anyio.create_memory_object_stream(10)
+        filt = _McpyNotificationReadFilter(recv, lambda m, r: None)
+        await send.send(self._msg('notifications/initialized'))
+        await send.aclose()
+
+        seen: list[str] = []
+        # Mirror the SDK's usage exactly: context-manage, then iterate.
+        async with filt:
+            async for msg in filt:
+                seen.append(msg.message.root.method)
+        assert seen == ['notifications/initialized']
+
+    def test_route_mcpy_list_changed_invalidates_cache(self):
+        import mcpyida.server as srv
+        from mcpyida.server import _route_mcpy_notification
+
+        srv._script_executing = False
+        srv._rpc_functions_discovered = True
+        _route_mcpy_notification('notifications/mcpy/functions/list_changed', None)
+        # _on_functions_changed() invalidates the discovery cache when idle.
+        assert srv._rpc_functions_discovered is False
+
+    def test_route_mcpy_unknown_is_ignored(self):
+        from mcpyida.server import _route_mcpy_notification
+
+        # Must not raise.
+        _route_mcpy_notification('notifications/mcpy/something_new', None)
+
+    def test_install_is_idempotent(self):
+        import mcp.server.session as _ss
+        from mcpyida.server import _install_mcpy_notification_routing
+
+        _install_mcpy_notification_routing()
+        _install_mcpy_notification_routing()
+        assert getattr(_ss.ServerSession, '_mcpy_routing_installed', False) is True
+
+    def test_install_wraps_session_read_stream(self):
+        import mcp.server.session as _ss
+        from mcp.server.models import InitializationOptions
+        from mcp.types import ServerCapabilities
+
+        from mcpyida.server import (
+            _McpyNotificationReadFilter,
+            _install_mcpy_notification_routing,
+        )
+
+        _install_mcpy_notification_routing()
+        _r_send, r_recv = anyio.create_memory_object_stream(1)
+        w_send, _w_recv = anyio.create_memory_object_stream(1)
+        opts = InitializationOptions(
+            server_name='t', server_version='0', capabilities=ServerCapabilities()
+        )
+        sess = _ss.ServerSession(r_recv, w_send, opts)
+        assert isinstance(sess._read_stream, _McpyNotificationReadFilter)
+
+
+# ---------------------------------------------------------------------------
+# TestTopLevelModuleShadowEscape — projected top-levels can't shadow real modules
+# ---------------------------------------------------------------------------
+
+
+class TestTopLevelModuleShadowEscape:
+    def _make_loop(self):
+        return MagicMock(spec=asyncio.AbstractEventLoop)
+
+    def _ns_with_names(self, names):
+        ns = RPCNamespace()
+        ns.update_functions({}, {n: _make_defn(n) for n in names})
+        return ns
+
+    def test_stdlib_module_top_level_escaped(self):
+        # os__foo would shadow the real `os` module in the REPL -> escape to _os.
+        ns = self._ns_with_names(['os__foo'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert 'os' not in injected
+        assert callable(injected['_os'].foo)
+
+    def test_ida_module_top_level_escaped(self):
+        # idaapi is a real (stubbed) module -> escape.
+        ns = self._ns_with_names(['idaapi__foo'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert 'idaapi' not in injected
+        assert callable(injected['_idaapi'].foo)
+
+    def test_mcp_top_level_blessed(self):
+        ns = self._ns_with_names(['mcp__peer__list'])
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert isinstance(injected['mcp'], ToolNamespace)
+        assert callable(injected['mcp'].peer.list)
+
+    def test_non_module_top_level_allowed(self):
+        ns = self._ns_with_names(['peer__list'])  # 'peer' is not importable
+        scope = CallbackScope()
+        injected = _build_rpc_globals(ns, None, scope, {}, self._make_loop())
+        assert isinstance(injected['peer'], ToolNamespace)
+        assert callable(injected['peer'].list)
+
+    def test_shadows_real_module_helper(self):
+        from mcpyida.server import _shadows_real_module
+
+        assert _shadows_real_module('os') is True
+        assert _shadows_real_module('sys') is True
+        assert _shadows_real_module('idaapi') is True
+        assert _shadows_real_module('mcp') is False  # blessed exception
+        assert _shadows_real_module('peer_xyz_nope') is False
+
+
+# ---------------------------------------------------------------------------
+# TestReplImport — faux namespaces are importable inside a script
+# ---------------------------------------------------------------------------
+
+
+class TestReplImport:
+    def _roots(self):
+        peer = ToolNamespace('mcp.peer')
+        peer._children['t'] = lambda: 'T'
+        mcp = ToolNamespace('mcp')
+        mcp._children['peer'] = peer
+        host = ToolNamespace('host')
+        host._children['echo'] = lambda: 'E'
+        return {'mcp': mcp, 'host': host}, mcp, peer, host
+
+    def _make_builtins(self):
+        import builtins as _b
+
+        import mcpyida.tools.scripting as scr
+
+        b = dict(vars(_b))
+        b['__import__'] = scr._repl_import
+        return b
+
+    def test_import_forms_resolve_faux_and_defer_real(self):
+        import json as real_json
+        import os as real_os
+
+        import mcpyida.tools.scripting as scr
+
+        roots, mcp, peer, host = self._roots()
+        g = {'__builtins__': self._make_builtins()}
+        saved = scr._active_import_roots
+        scr._active_import_roots = roots
+        try:
+            exec(
+                'import mcp as M\n'
+                'import mcp.peer as P\n'
+                'from mcp.peer import t\n'
+                'import host\n'
+                'from host import echo\n'
+                'import os\n'
+                'import json as J\n',
+                g,
+            )
+        finally:
+            scr._active_import_roots = saved
+
+        assert g['M'] is mcp
+        assert g['P'] is peer
+        assert g['t']() == 'T'
+        assert g['host'] is host
+        assert g['echo']() == 'E'
+        assert g['os'] is real_os
+        assert g['J'] is real_json
+
+    def test_inactive_defers_to_real_importer(self):
+        import os as real_os
+
+        import mcpyida.tools.scripting as scr
+
+        g = {'__builtins__': self._make_builtins()}
+        saved = scr._active_import_roots
+        scr._active_import_roots = None
+        try:
+            exec('import os', g)
+        finally:
+            scr._active_import_roots = saved
+        assert g['os'] is real_os
+
+    def test_relative_import_defers(self):
+        import mcpyida.tools.scripting as scr
+
+        roots, *_ = self._roots()
+        saved = scr._active_import_roots
+        scr._active_import_roots = roots
+        try:
+            # level>0 (relative) defers to the real importer even for a faux
+            # top-level name ('mcp'); with no package context it raises (proving
+            # it did NOT return the faux namespace).
+            with pytest.raises((ImportError, KeyError, ValueError)):
+                scr._repl_import('mcp', {}, {}, (), 1)
+        finally:
+            scr._active_import_roots = saved
+
+
+class TestReplImportEndToEnd:
+    """import statements resolve faux namespaces through the real eval flow."""
+
+    def test_import_mcp_self_in_real_eval(self):
+        import mcpyida.tools.scripting as scr
+        from mcpyida.tools.scripting import _idapython_eval_sync
+
+        saved = scr._persistent_globals
+        scr._persistent_globals = None  # force the reset path so _add_extras runs
+        try:
+            res = _idapython_eval_sync(
+                'import mcp\n'
+                'import mcp.self as S\n'
+                'from mcp.self import decompile\n'
+                'import os\n'
+                '(type(mcp).__name__, type(S).__name__, callable(decompile), '
+                'os.path.sep)',
+                reset=True,
+            )
+        finally:
+            scr._persistent_globals = saved
+
+        assert res.success, res.error
+        # mcp and mcp.self are faux ToolNamespaces; decompile is callable;
+        # os is the REAL module (os.path.sep == '/').
+        assert 'ToolNamespace' in str(res.result)
+        assert 'True' in str(res.result)
+        assert "'/'" in str(res.result)

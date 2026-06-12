@@ -207,12 +207,17 @@ async def run_on_ida_main_async(func, *args, **kwargs):
         _ida_work_queue.put(work_item)
         return await future
     else:
-        # GUI mode: dispatch via anyio thread pool + execute_sync inside thread.
+        # GUI mode: if we're already on the IDA main thread (e.g. an in-process
+        # self-tool call from a running script), run directly. Offloading to a
+        # worker thread only to execute_sync back to the main thread we're on is
+        # wasteful and deadlocks when the main thread is mid-script.
+        if ida_pro.is_main_thread():
+            return func(*args, **kwargs)
+
+        # Not on the main thread: dispatch via anyio thread pool + execute_sync.
         import anyio
 
         def _run_sync() -> Any:
-            if ida_pro.is_main_thread():
-                return func(*args, **kwargs)
             result_container: list = []
 
             def inner() -> int:

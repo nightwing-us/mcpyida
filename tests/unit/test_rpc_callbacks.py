@@ -5,7 +5,7 @@ no IDA-specific imports.
 
 Test classes:
 - TestCallbackScope        — validity token lifecycle
-- TestRPCNamespace         — available(), help(), mock(), is_available(), __getattr__
+- TestRPCNamespace         — available(), help(), _mocks injection, is_available(), __getattr__
 - TestIsNameSafe           — denylist: builtins, keywords, existing globals, safe names
 - TestGenerateCallbackFunction — positional, keyword, both, defaults, _rpc_timeout, scope, mock
 - TestBuildDocstring       — description, params, timeout, return
@@ -25,11 +25,13 @@ from mcpyida.rpc_callbacks import (
     RPCError,
     RPCNamespace,
     RPCTimeoutError,
+    ToolNamespace,
     _PYTHON_DENYLIST,
     _build_docstring,
     generate_callback_function,
     is_name_safe,
     map_exception,
+    project_name,
 )
 from mcpyida.rpc_types import FunctionDefinition
 
@@ -243,13 +245,11 @@ class TestRPCNamespace:
         with pytest.raises(AttributeError):
             _ = ns._nonexistent_private
 
-    # --- mock() ---
+    # --- mocks (_mocks dict; no script-facing mock() method) ---
 
-    def test_mock_registered_in_mocks_dict(self):
-        ns = RPCNamespace()
-        handler = lambda: 42
-        ns.mock('my_fn', handler)
-        assert ns._mocks['my_fn'] is handler
+    def test_no_script_facing_mock_method(self):
+        # The script-facing mock() API was removed; mocks go in _mocks directly.
+        assert not hasattr(RPCNamespace(), 'mock')
 
     def test_mock_overrides_real_call(self):
         ns = RPCNamespace()
@@ -258,7 +258,7 @@ class TestRPCNamespace:
         fn = generate_callback_function(defn, mock_rpc_caller, scope, ns)
         ns.update_functions({'search_web': fn}, {'search_web': defn})
 
-        ns.mock('search_web', lambda query, max_results=10: f'mocked:{query}')
+        ns._mocks['search_web'] = lambda query, max_results=10: f'mocked:{query}'
         result = fn('hello')
         assert result == 'mocked:hello'
 
@@ -515,7 +515,7 @@ class TestGenerateCallbackFunction:
             return 'mock_result'
 
         fn = generate_callback_function(defn, mock_rpc_caller, scope, ns)
-        ns.mock('search_web', mock_handler)
+        ns._mocks['search_web'] = mock_handler
         ns.update_functions({'search_web': fn}, {'search_web': defn})
 
         result = fn('test_query', 3)
@@ -528,7 +528,7 @@ class TestGenerateCallbackFunction:
         defn = _make_defn()
 
         received: list = []
-        ns.mock('search_web', lambda *a, **kw: received.append((a, kw)) or 'ok')
+        ns._mocks['search_web'] = lambda *a, **kw: received.append((a, kw)) or 'ok'
         fn = generate_callback_function(defn, mock_rpc_caller, scope, ns)
 
         fn('q1', 5)
@@ -713,3 +713,94 @@ class TestMapException:
     def test_rpc_disconnected_error_is_rpc_error(self):
         from mcpyida.rpc_callbacks import RPCDisconnectedError, RPCError
         assert issubclass(RPCDisconnectedError, RPCError)
+
+
+# ===========================================================================
+# TestProjectName
+# ===========================================================================
+
+class TestProjectName:
+    @pytest.mark.parametrize('raw,expected', [
+        ('mcp__ghidra1__list', ['mcp', 'ghidra1', 'list']),
+        ('__foo', ['foo']),
+        ('foo__', ['foo']),
+        ('a____b', ['a', 'b']),
+        ('mcp___ghidra1', ['mcp', 'ghidra1']),
+        ('search_web', ['search_web']),
+        ('find_bytes', ['find_bytes']),
+        ('foo_', ['foo_']),
+        ('__mcp__ghidra1__list__', ['mcp', 'ghidra1', 'list']),
+        ('__init__', ['init']),
+    ])
+    def test_split_table(self, raw, expected):
+        assert project_name(raw) == expected
+
+    def test_all_underscores_returns_none(self):
+        assert project_name('____') is None
+
+    def test_empty_returns_none(self):
+        assert project_name('') is None
+
+    def test_hard_keyword_segment_escaped(self):
+        assert project_name('mcp__import__x') == ['mcp', '_import', 'x']
+
+    def test_hard_keyword_first_segment_escaped(self):
+        assert project_name('class__foo') == ['_class', 'foo']
+
+    def test_soft_keyword_not_escaped(self):
+        # 'match' is a soft keyword — valid as a dotted attribute, left as-is.
+        assert project_name('mcp__match') == ['mcp', 'match']
+
+    def test_builtin_segment_not_escaped(self):
+        # builtins are fine as attribute names (mcp.list compiles)
+        assert project_name('mcp__list') == ['mcp', 'list']
+
+
+# ===========================================================================
+# TestToolNamespace
+# ===========================================================================
+
+class TestToolNamespace:
+    def _populate(self) -> ToolNamespace:
+        root = ToolNamespace('mcp')
+        child = ToolNamespace('mcp.ghidra1')
+        root._children['ghidra1'] = child
+        child._children['list'] = lambda: 'listed'
+        return root
+
+    def test_attribute_access_to_child_namespace(self):
+        root = self._populate()
+        assert isinstance(root.ghidra1, ToolNamespace)
+
+    def test_attribute_access_to_leaf_callable(self):
+        root = self._populate()
+        assert root.ghidra1.list() == 'listed'
+
+    def test_missing_attribute_raises(self):
+        root = self._populate()
+        with pytest.raises(AttributeError, match="has no attribute 'nope'"):
+            _ = root.nope
+
+    def test_dir_lists_children_sorted(self):
+        root = ToolNamespace('mcp')
+        root._children['zebra'] = lambda: None
+        root._children['alpha'] = lambda: None
+        assert dir(root) == ['alpha', 'zebra']
+
+    def test_underscore_escaped_child_reachable(self):
+        # escaped hard-keyword leaves (e.g. '_import') must be accessible
+        root = ToolNamespace('mcp')
+        root._children['_import'] = lambda: 'imported'
+        assert root._import() == 'imported'
+
+    def test_repr_includes_path_and_children(self):
+        root = ToolNamespace('mcp')
+        root._children['a'] = lambda: None
+        r = repr(root)
+        assert 'mcp' in r and 'a' in r
+
+    def test_private_attrs_not_shadowed_by_getattr(self):
+        # _path / _children are real instance attrs, not routed through children
+        root = ToolNamespace('mcp')
+        assert root._path == 'mcp'
+        assert root._children == {}

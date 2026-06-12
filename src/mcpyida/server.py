@@ -14,11 +14,13 @@ Usage::
 import asyncio
 import contextvars
 import functools
+import importlib.util
 import inspect
 import logging
 import os
 import queue
 import re
+import sys
 import time
 import typing
 from contextlib import asynccontextmanager
@@ -33,7 +35,12 @@ from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.exceptions import McpError
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCError, JSONRPCMessage, JSONRPCRequest
+from mcp.types import (
+    JSONRPCError,
+    JSONRPCMessage,
+    JSONRPCNotification,
+    JSONRPCRequest,
+)
 from pydantic import Field
 from starlette.middleware.cors import CORSMiddleware
 
@@ -45,9 +52,11 @@ from mcpyida.rpc_callbacks import (
     RPCError,
     RPCNamespace,
     RPCTimeoutError,
+    ToolNamespace,
     generate_callback_function,
     is_name_safe,
     map_exception,
+    project_name,
 )
 from mcpyida.rpc_types import (
     CallFunctionException,
@@ -263,6 +272,11 @@ async def _send_custom_request(
         await response_stream_reader.aclose()
 
 
+def _noop() -> None:
+    """No-op sentinel pushed onto the IDA work queue to wake the RPC pump."""
+    return None
+
+
 def _make_sync_caller_ida(
     session: Any,
     scope: CallbackScope,
@@ -325,6 +339,11 @@ def _make_sync_caller_ida(
         future = asyncio.run_coroutine_threadsafe(
             _async_call(name, arguments, timeout), event_loop
         )
+
+        # Wake the pump the instant the callback response lands instead of
+        # waiting out the poll interval. The no-op sentinel is drained by this
+        # loop's next get() (or a later sync_call / the headless pump) — harmless.
+        future.add_done_callback(lambda _f: _ida_work_queue.put(_noop))
 
         deadline = time.monotonic() + timeout
         while not future.done():
@@ -411,6 +430,8 @@ async def _discover_rpc_functions(session: Any) -> RPCNamespace | None:
     # are regenerated per-execution — this discovery step only records which
     # functions exist so we know their definitions.
     for defn in all_functions:
+        # Raw-name denylist check (flat names). Nested `__` names are projected and
+        # escaped per-segment later in _build_rpc_globals via project_name().
         if not is_name_safe(defn.name):
             logger.warning('Skipping unsafe callback function name: %r', defn.name)
             continue
@@ -422,18 +443,88 @@ async def _discover_rpc_functions(session: Any) -> RPCNamespace | None:
     return namespace
 
 
+def _install_rpc_path(
+    roots: dict[str, Any],
+    path: list[str],
+    fn: Any,
+) -> bool:
+    """Insert callable *fn* into the nested namespace tree at *path*.
+
+    All but the last segment are namespace levels (auto-created as
+    ToolNamespace); the last segment is the callable leaf. Returns ``False``
+    and installs nothing on a conflict:
+
+    - a namespace segment is already bound to a callable (cannot nest under it)
+    - the leaf slot is already occupied (by a namespace or another callable)
+
+    Args:
+        roots: Top-level mapping (name -> ToolNamespace | callable).
+        path: Attribute path segments (length >= 1).
+        fn: The callback wrapper to bind at the leaf.
+
+    Returns:
+        True if installed, False on conflict.
+    """
+    *ns_segs, leaf = path
+    children = roots
+    prefix: list[str] = []
+    for seg in ns_segs:
+        prefix.append(seg)
+        node = children.get(seg)
+        if node is None:
+            node = ToolNamespace('.'.join(prefix))
+            children[seg] = node
+        elif not isinstance(node, ToolNamespace):
+            return False  # a callable occupies this path — cannot nest under it
+        children = node._children
+    if leaf in children:
+        return False  # leaf slot already taken (namespace or duplicate callable)
+    children[leaf] = fn
+    return True
+
+
+def _shadows_real_module(name: str) -> bool:
+    """True if *name* names an importable module/package.
+
+    A projected faux top-level with such a name would shadow the real module in
+    the script's import machinery (see the REPL ``__import__`` support in
+    scripting.py), so it must be escaped. ``mcp`` is the one blessed exception:
+    the real MCP SDK is never used inside the idapython REPL, so ``mcp.*`` is the
+    intended faux import root.
+    """
+    if name == 'mcp':
+        return False
+    if name in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
+def _top_level_collides(name: str, existing_globals: dict[str, Any]) -> bool:
+    """A projected top-level *name* is unsafe if it would shadow a Python
+    builtin/keyword, an existing scripting global, or an importable module."""
+    return not is_name_safe(name, existing_globals) or _shadows_real_module(name)
+
+
 def _build_rpc_globals(
     namespace: RPCNamespace,
     session: Any,
     scope: CallbackScope,
     existing_globals: dict[str, Any],
     event_loop: asyncio.AbstractEventLoop | None = None,
+    roots: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate per-execution callback globals from a discovered RPCNamespace.
 
-    Creates fresh callback function wrappers bound to *scope* and *session*
-    for all definitions stored in *namespace*.  Only injects functions whose
-    names pass is_name_safe() against *existing_globals*.
+    Projects ``__``-separated function names into nested ToolNamespace objects
+    (``mcp__ghidra1__list`` -> ``mcp.ghidra1.list``). Names with no separator
+    are injected as flat globals. The top-level segment is the only real
+    global; if it would shadow an existing global / builtin / keyword it is
+    escaped with a leading underscore (skipped only if the escaped name also
+    collides). Functions are processed in sorted name order so leaf-vs-namespace
+    conflicts resolve deterministically (first claim wins).
 
     Args:
         namespace:        The cached RPCNamespace populated by _discover_rpc_functions.
@@ -441,33 +532,129 @@ def _build_rpc_globals(
         scope:            The CallbackScope for this execution.
         existing_globals: The current script globals (used for collision detection).
         event_loop:       The asyncio event loop for the IDA sync caller bridge.
+        roots:            If provided, reverse-RPC entries are merged into it so that
+                          mcp.self.* and mcp.<other>.* share one `mcp` root.
 
     Returns:
-        A dict of {name: callable} to merge into script globals.  Always
-        includes the 'rpc' key pointing to a fresh RPCNamespace.
+        A dict of top-level name -> object (ToolNamespace or callable) to merge
+        into the script globals.  The caller removes these same keys when the
+        tool execution ends.
     """
-    new_functions: dict[str, Any] = {}
-    new_definitions: dict[str, FunctionDefinition] = {}
-
+    if roots is None:
+        roots = {}
     rpc_caller = _make_sync_caller_ida(session, scope, event_loop)  # type: ignore[arg-type]
 
-    for name, defn in namespace._definitions.items():
-        if not is_name_safe(name, existing_globals):
-            logger.debug(
-                'Skipping callback %r: name collision with existing globals', name
+    for name in sorted(namespace._definitions.keys()):
+        defn = namespace._definitions[name]
+        path = project_name(name)
+        if path is None:
+            logger.warning('Skipping RPC callback %r: no usable name segments', name)
+            continue
+
+        # The top-level segment is the only real global; escape it if it would
+        # shadow an existing global, builtin, or keyword.
+        top = path[0]
+        if _top_level_collides(top, existing_globals):
+            escaped = '_' + top
+            if _top_level_collides(escaped, existing_globals):
+                logger.warning(
+                    'Skipping RPC callback %r: top-level name %r collides with an '
+                    'existing global, builtin, or importable module',
+                    name,
+                    top,
+                )
+                continue
+            top = escaped
+        path = [top, *path[1:]]
+
+        if path[:2] == ['mcp', 'self']:
+            logger.warning(
+                'Skipping RPC callback %r: mcp.self.* is reserved for in-process tools',
+                name,
             )
             continue
+
         fn = generate_callback_function(defn, rpc_caller, scope, namespace)
-        new_functions[name] = fn
-        new_definitions[name] = defn
+        # help()/pydoc shows __name__; use the projected dotted path so
+        # help(mcp.ghidra1.list) reads 'mcp.ghidra1.list(...)' rather than the
+        # raw 'mcp__ghidra1__list'. The wire call still uses the original name
+        # (captured in the wrapper's closure, unaffected by __name__).
+        _dotted = '.'.join(path)
+        fn.__name__ = _dotted
+        fn.__qualname__ = _dotted
+        if not _install_rpc_path(roots, path, fn):
+            logger.warning(
+                'Skipping RPC callback %r: path %r conflicts with an existing namespace or function',
+                name,
+                '.'.join(path),
+            )
 
-    # Build an execution-specific RPCNamespace with freshly-bound wrappers.
-    exec_namespace = RPCNamespace()
-    exec_namespace.update_functions(new_functions, new_definitions)
+    return roots
 
-    injected: dict[str, Any] = {'rpc': exec_namespace}
-    injected.update(new_functions)
-    return injected
+
+# Tools NOT projected into mcp.self.* (the code-exec tool would just nest exec).
+_SELF_EXCLUDED_TOOLS: frozenset[str] = frozenset({'idapython'})
+
+
+def _drive_coro_sync(coro: Any) -> Any:
+    """Run *coro* to completion on the current thread and return its result.
+
+    Used to call an async tool coroutine from synchronous script code that runs
+    on the IDA main thread. Safe because run_on_ida_main_async short-circuits to
+    a direct synchronous call on the main thread, so the coroutine's awaits
+    resolve in-line without needing the server's event loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass  # no running loop on this thread — safe to drive synchronously
+    else:
+        raise RuntimeError(
+            '_drive_coro_sync must not be called while an event loop is running '
+            'on this thread (expected: the IDA main thread, which has none)'
+        )
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _make_self_tool_wrapper(bound_method: Any) -> Any:
+    """Wrap an async McpToolRegistration method as a sync in-process callable."""
+
+    def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _drive_coro_sync(bound_method(*args, **kwargs))
+
+    _wrapper.__name__ = getattr(bound_method, '__name__', 'tool')
+    _wrapper.__qualname__ = _wrapper.__name__
+    _wrapper.__doc__ = getattr(bound_method, '__doc__', None)
+    return _wrapper
+
+
+# Always-injected by scripting._idapython_eval_sync (mcp.self.* is available
+# regardless of whether the client supports reverse-RPC callbacks).
+def _build_self_globals() -> dict[str, Any]:
+    """Build {'mcp': ToolNamespace} exposing this server's own tools as
+    mcp.self.<tool>(), dispatched in-process (no reverse-RPC).
+
+    Enumerates McpToolRegistration.iter_tools(), skips _SELF_EXCLUDED_TOOLS,
+    and binds each tool to an in-process sync wrapper.
+
+    Tools are invoked without an MCP Context, so confirmation elicitation is bypassed
+    (auto-allow) — acceptable because scripts already have full in-process IDA access.
+    """
+    registration = McpToolRegistration()
+    self_ns = ToolNamespace('mcp.self')
+    for method_name, tool_name, _annotations, _is_readonly in registration.iter_tools():
+        if tool_name in _SELF_EXCLUDED_TOOLS:
+            continue
+        bound = getattr(registration, method_name)
+        self_ns._children[tool_name] = _make_self_tool_wrapper(bound)
+
+    mcp_root = ToolNamespace('mcp')
+    mcp_root._children['self'] = self_ns
+    return {'mcp': mcp_root}
 
 
 def _declare_rpc_capability(mcp: FastMCP) -> None:
@@ -494,6 +681,101 @@ def _declare_rpc_capability(mcp: FastMCP) -> None:
         )
 
     low_level.create_initialization_options = _patched  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# mcpy/ notification routing (receive side)
+# ---------------------------------------------------------------------------
+#
+# The MCP SDK validates every inbound notification against ClientNotification
+# (a closed discriminated union). ``notifications/mcpy/*`` is not in that union,
+# so the SDK's _receive_loop raises a validation error, logs a warning, and
+# DROPS the notification — _on_functions_changed() never fires. We intercept
+# mcpy/ notifications BEFORE that validation by wrapping the ServerSession read
+# stream: mcpy/ notifications are routed to our handler and never reach the
+# validator; all other messages pass through untouched.
+
+
+def _route_mcpy_notification(method: str, root: Any) -> None:
+    """Dispatch an inbound ``notifications/mcpy/*`` notification."""
+    if method == 'notifications/mcpy/functions/list_changed':
+        logger.debug('[rpc] received mcpy functions/list_changed')
+        _on_functions_changed()
+    else:
+        logger.debug('[rpc] ignoring unknown mcpy notification: %s', method)
+
+
+class _McpyNotificationReadFilter:
+    """Wraps a ServerSession read stream, extracting ``notifications/mcpy/*``.
+
+    Matching notifications are routed via *on_mcpy* and NOT yielded (so they
+    never reach the SDK's ClientNotification validator). Every other message is
+    passed through unchanged. Non-iteration attributes delegate to the wrapped
+    stream so the session can still close/manage it.
+    """
+
+    def __init__(
+        self, inner: Any, on_mcpy: 'typing.Callable[[str, Any], None]'
+    ) -> None:
+        self._inner = inner
+        self._on_mcpy = on_mcpy
+        self._it = inner.__aiter__()
+
+    def __aiter__(self) -> '_McpyNotificationReadFilter':
+        return self
+
+    async def __aenter__(self) -> '_McpyNotificationReadFilter':
+        # BaseSession._receive_loop does `async with self._read_stream`. Async-CM
+        # dunders are resolved on the type, bypassing __getattr__, so these MUST
+        # live on the class — delegate to the wrapped stream and keep filtering.
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        return await self._inner.__aexit__(*exc_info)
+
+    async def __anext__(self) -> Any:
+        while True:
+            msg = await self._it.__anext__()  # raises StopAsyncIteration at end
+            root = getattr(getattr(msg, 'message', None), 'root', None)
+            method = getattr(root, 'method', None)
+            if (
+                isinstance(root, JSONRPCNotification)
+                and isinstance(method, str)
+                and method.startswith('notifications/mcpy/')
+            ):
+                try:
+                    self._on_mcpy(method, root)
+                except Exception:
+                    logger.debug('mcpy notification handler error', exc_info=True)
+                continue
+            return msg
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _install_mcpy_notification_routing() -> None:
+    """Patch ServerSession to route inbound mcpy/ notifications.
+
+    Wraps each new ServerSession's read stream with _McpyNotificationReadFilter.
+    Idempotent. Pinned SDK seam: mcp.server.session.ServerSession.__init__
+    (read_stream is its first positional arg).
+    """
+    import mcp.server.session as _ss
+
+    if getattr(_ss.ServerSession, '_mcpy_routing_installed', False):
+        return
+
+    _orig_init = _ss.ServerSession.__init__
+
+    @functools.wraps(_orig_init)
+    def _patched_init(self: Any, read_stream: Any, *args: Any, **kwargs: Any) -> None:
+        read_stream = _McpyNotificationReadFilter(read_stream, _route_mcpy_notification)
+        _orig_init(self, read_stream, *args, **kwargs)
+
+    _ss.ServerSession.__init__ = _patched_init  # type: ignore[method-assign]
+    _ss.ServerSession._mcpy_routing_installed = True  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +859,7 @@ class McpToolRegistration:
             ('create_struct', 'create_struct', {}, False),
             ('add_field', 'add_field', {}, False),
             # Scripting
-            ('idapython_eval', 'idapython', {}, False),
+            ('idapython_eval', 'idapython', {'executesCode': True}, False),
             # Search tools
             ('find_bytes', 'find_bytes', {'readOnlyHint': True}, True),
             ('find_insns', 'find_insns', {'readOnlyHint': True}, True),
@@ -1101,7 +1383,13 @@ class McpToolRegistration:
                 )
             ),
         ] = False,
-        ctx: Context | None = None,
+        # NOTE: must be plain `Context`, NOT `Context | None`. FastMCP's
+        # context-param detection (mcp/server/fastmcp/tools/base.py) skips any
+        # parameter whose annotation has a typing origin (Union/Optional), so
+        # `Context | None` is never injected and arrives as None — which
+        # silently disabled RPC callback discovery. Plain `Context` is detected
+        # and injected; the `= None` default only covers direct/test calls.
+        ctx: Context = None,  # type: ignore[assignment]
     ) -> Any:
         """Execute arbitrary Python code in the IDA Pro context.
 
@@ -1915,6 +2203,7 @@ def create_mcp_app(
     instructions = build_instructions()
     mcp = FastMCP(name, instructions=instructions)
     _declare_rpc_capability(mcp)
+    _install_mcpy_notification_routing()
 
     @asynccontextmanager
     async def parent_lifespan(app: FastAPI) -> Any:  # type: ignore[misc]
