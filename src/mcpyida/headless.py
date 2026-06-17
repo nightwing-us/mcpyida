@@ -73,12 +73,31 @@ def main() -> None:
         default=6150,
         help='Port for MCP server (default: 6150, 0 for auto-assign)',
     )
+    parser.add_argument(
+        '--idb-path',
+        default=None,
+        help='Output path (extension optional) for the IDA database. Passes IDA '
+        "'-o' so the .i64/.idb is written here instead of beside the binary "
+        '(idalib has no db-path arg otherwise). Default: beside the binary.',
+    )
     args = parser.parse_args()
 
     binary_path = Path(args.binary).resolve()
     if not binary_path.exists():
         print(f'Error: binary not found: {binary_path}', file=sys.stderr)
         sys.exit(1)
+
+    # Resolve --idb-path now (before the expensive idalib import) so bad input
+    # fails fast. IDA splits the '-o' argument string on whitespace, so a path
+    # containing spaces is silently mis-parsed into multiple args — reject it.
+    idb_path = None
+    if args.idb_path:
+        idb_path = str(Path(args.idb_path).expanduser())
+        if any(c.isspace() for c in idb_path):
+            parser.error(
+                f'--idb-path must not contain whitespace (IDA splits the -o '
+                f'argument on spaces): {idb_path!r}'
+            )
 
     # Check prerequisites before expensive imports.
     #
@@ -132,54 +151,83 @@ def main() -> None:
     # returns True immediately, even if idalib doesn't set the batch flag.
     os.environ['MCPYIDA_HEADLESS'] = '1'
 
-    # idalib must be imported first — initializes the IDA environment
+    # idalib must be imported first — initializes the IDA environment.
+    # --idb-path threads IDA's '-o' switch so the database lands at a controlled
+    # location (idalib follows symlinks to the real binary, so a symlink trick
+    # does NOT work; '-o' is the only clean lever — validated on IDA 9.2).
+    open_args = f'-o{idb_path}' if idb_path else None
     print('Starting IDA headless (idalib)...', file=sys.stderr)
     try:
-        idapro.open_database(str(binary_path), run_auto_analysis=True)
+        idapro.open_database(str(binary_path), run_auto_analysis=True, args=open_args)
     except Exception as e:
         print(f'Error: Failed to open binary: {e}', file=sys.stderr)
         sys.exit(1)
 
-    import ida_auto
+    # Persist the database on SIGTERM. The `finally: close_database()` below saves
+    # on graceful exit (KeyboardInterrupt/normal), but a default SIGTERM terminates
+    # the process and skips it — losing analysis/edits. Convert SIGTERM into
+    # KeyboardInterrupt so the shutdown path (finally -> close_database) runs.
+    # Registered here, right after the database is open, so it also covers
+    # auto-analysis and server startup — not just the work-queue pump loop.
+    # IDA is native (no JVM), so no '-Xrs' is needed here. Validated on IDA 9.2:
+    # a rename survives SIGTERM with this; without it it is lost.
+    import signal as _signal
 
-    print('Waiting for auto-analysis to complete...', file=sys.stderr)
-    ida_auto.auto_wait()
-    print('Analysis complete.', file=sys.stderr)
+    def _on_sigterm(_signum, _frame):
+        raise KeyboardInterrupt
 
-    print(f'Starting MCP server on {args.host}:{args.port}...', file=sys.stderr)
-    from mcpyida.mcpserver import McpServer, set_headless_dispatcher, get_ida_work_queue
+    _signal.signal(_signal.SIGTERM, _on_sigterm)
 
-    # Register the work-queue dispatcher so that run_in_ida_main routes IDA
-    # API calls through the main-thread queue instead of calling directly from
-    # the uvicorn thread (which IDA 9 rejects with RuntimeError).
-    set_headless_dispatcher(run_on_main_thread)
-
-    # Use McpServer for lifecycle management (threading, sockets, port assignment).
-    # McpServer.start() calls server.create_mcp_app() internally.
-    server = McpServer()
-    server.start(args.host, args.port)
-
-    actual_port = server.port
-    if actual_port is None or actual_port <= 0:
-        print(f'Error: server port not assigned (got {actual_port!r})', file=sys.stderr)
-        sys.exit(1)
-
-    status = {
-        'status': 'ready',
-        'host': args.host,
-        'port': actual_port,
-        'binary': str(binary_path),
-    }
-    print(json.dumps(status), flush=True)
-
-    # Pump the IDA main-thread work queue.
-    #
-    # Both async tool handlers (via run_on_ida_main_async) and sync tool
-    # handlers (via run_in_ida_main / run_on_main_thread) submit work items
-    # here.  We execute them on the main thread and return results via
-    # asyncio Future callbacks or threading.Event signals respectively.
-    _work_queue = get_ida_work_queue()
+    # Everything past open_database runs under a finally that closes (and saves)
+    # the database, so a SIGTERM (now a KeyboardInterrupt) anywhere below persists.
+    server = None
     try:
+        import ida_auto
+
+        print('Waiting for auto-analysis to complete...', file=sys.stderr)
+        ida_auto.auto_wait()
+        print('Analysis complete.', file=sys.stderr)
+
+        print(f'Starting MCP server on {args.host}:{args.port}...', file=sys.stderr)
+        from mcpyida.mcpserver import (
+            McpServer,
+            set_headless_dispatcher,
+            get_ida_work_queue,
+        )
+
+        # Register the work-queue dispatcher so that run_in_ida_main routes IDA
+        # API calls through the main-thread queue instead of calling directly from
+        # the uvicorn thread (which IDA 9 rejects with RuntimeError).
+        set_headless_dispatcher(run_on_main_thread)
+
+        # Use McpServer for lifecycle management (threading, sockets, ports).
+        # McpServer.start() calls server.create_mcp_app() internally.
+        server = McpServer()
+        server.start(args.host, args.port)
+
+        actual_port = server.port
+        if actual_port is None or actual_port <= 0:
+            print(
+                f'Error: server port not assigned (got {actual_port!r})',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        status = {
+            'status': 'ready',
+            'host': args.host,
+            'port': actual_port,
+            'binary': str(binary_path),
+        }
+        print(json.dumps(status), flush=True)
+
+        # Pump the IDA main-thread work queue.
+        #
+        # Both async tool handlers (via run_on_ida_main_async) and sync tool
+        # handlers (via run_in_ida_main / run_on_main_thread) submit work items
+        # here.  We execute them on the main thread and return results via
+        # asyncio Future callbacks or threading.Event signals respectively.
+        _work_queue = get_ida_work_queue()
         while True:
             try:
                 work_item = _work_queue.get(timeout=0.1)
@@ -188,8 +236,9 @@ def main() -> None:
                 pass
     except KeyboardInterrupt:
         print('Shutting down...', file=sys.stderr)
-        server.stop()
     finally:
+        if server is not None:
+            server.stop()
         idapro.close_database()
 
 

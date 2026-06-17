@@ -3,6 +3,27 @@
 All notable changes to **MCPyIDA** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-06-17
+
+Headless database-location control and crash-safe persistence.
+
+### Added
+
+- **`--idb-path` for the headless server.** Controls where the IDA database
+  (`.i64`/`.idb`) is written, instead of the default location beside the input
+  binary. The extension is optional; the path must not contain whitespace.
+
+### Fixed
+
+- **Headless analysis and edits are now saved on `SIGTERM`.** A `SIGTERM`
+  previously terminated the process without saving, losing auto-analysis results
+  and any edits made over MCP. The server now shuts down gracefully and saves the
+  database.
+
+### Upgrade
+
+Drop-in upgrade — no breaking API changes.
+
 ## [0.7.0] - 2026-06-12
 
 Enhancements to the embedded `idapython` scripting environment and the
@@ -53,5 +74,6 @@ nested `prefix.name()`. Update any scripts that referenced the flat form.
 Releases up to and including v0.6.0 predate this changelog; see the Git history
 and the GitHub release notes for details.
 
+[0.7.1]: https://github.com/nightwing-us/mcpyida/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/nightwing-us/mcpyida/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/nightwing-us/mcpyida/releases/tag/v0.6.0
