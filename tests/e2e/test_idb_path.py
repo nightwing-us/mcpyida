@@ -54,7 +54,6 @@ def _launch(extra_args: list[str], binary: str = CRACKME_ELF) -> subprocess.Pope
             sys.executable,
             '-m',
             'mcpyida.headless',
-            '--binary',
             binary,
             '--port',
             '0',

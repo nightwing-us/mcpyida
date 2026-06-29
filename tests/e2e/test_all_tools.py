@@ -259,35 +259,35 @@ class TestContextTool:
 # Tool 4: get_funcs
 # ---------------------------------------------------------------------------
 
-class TestGetFuncsTool:
-    """Tool: get_funcs — items: list of addr/name strings."""
+class TestFuncsTool:
+    """Tool: funcs — items: list of addr/name strings."""
 
     def test_get_funcs_by_name(self, headless_server):
-        """get_funcs(['main']) returns function info."""
-        result = mcp_call(headless_server, 'get_funcs', {
+        """funcs(['main']) returns function info."""
+        result = mcp_call(headless_server, 'funcs', {
             'items': ['main'],
         })
         assert 'main' in result
 
     def test_get_funcs_multiple(self, headless_server):
-        """get_funcs with multiple names returns multiple results."""
-        result = mcp_call(headless_server, 'get_funcs', {
+        """funcs with multiple names returns multiple results."""
+        result = mcp_call(headless_server, 'funcs', {
             'items': ['main', 'check_password'],
         })
         assert 'main' in result
         assert 'check_password' in result
 
     def test_get_funcs_by_address(self, headless_server, binary_addresses):
-        """get_funcs with hex address returns function info."""
+        """funcs with hex address returns function info."""
         main_addr = binary_addresses['main']
-        result = mcp_call(headless_server, 'get_funcs', {
+        result = mcp_call(headless_server, 'funcs', {
             'items': [main_addr],
         })
         assert 'main' in result
 
     def test_get_funcs_unknown_name_returns_error_field(self, headless_server):
-        """get_funcs with unknown name returns per-item error, not MCP error."""
-        result = mcp_call(headless_server, 'get_funcs', {
+        """funcs with unknown name returns per-item error, not MCP error."""
+        result = mcp_call(headless_server, 'funcs', {
             'items': ['nonexistent_function_xyz_123'],
         })
         # Should be a per-item error in the response list, not a top-level MCP error
@@ -453,7 +453,7 @@ class TestRenameTool:
         assert 'cp_test_tmp' in result1 or 'error' not in result1.lower()
 
         # Step 2: verify the new name exists
-        result2 = mcp_call(fresh_headless_server, 'get_funcs', {
+        result2 = mcp_call(fresh_headless_server, 'funcs', {
             'items': ['cp_test_tmp'],
         })
         assert 'cp_test_tmp' in result2
@@ -465,7 +465,7 @@ class TestRenameTool:
         assert 'check_password' in result3 or 'error' not in result3.lower()
 
         # Step 4: verify original name is back
-        result4 = mcp_call(fresh_headless_server, 'get_funcs', {
+        result4 = mcp_call(fresh_headless_server, 'funcs', {
             'items': ['check_password'],
         })
         assert 'check_password' in result4
@@ -514,8 +514,8 @@ class TestElicitationFallback:
         if isinstance(data, list) and data:
             assert data[0].get('error') is None, f"Rename failed: {data[0].get('error')}"
 
-        # Step 2: Verify the rename took effect via get_funcs
-        result2 = mcp_call(fresh_headless_server, 'get_funcs', {
+        # Step 2: Verify the rename took effect via funcs
+        result2 = mcp_call(fresh_headless_server, 'funcs', {
             'items': ['elicit_test_renamed'],
         })
         assert 'elicit_test_renamed' in result2
@@ -598,7 +598,7 @@ class TestElicitationE2E:
 
                     # Verify rename took effect
                     with anyio.fail_after(MCP_CALL_TIMEOUT):
-                        result2 = await session.call_tool('get_funcs', {
+                        result2 = await session.call_tool('funcs', {
                             'items': ['elicit_accepted'],
                         })
                     assert not result2.isError
@@ -644,7 +644,7 @@ class TestElicitationE2E:
 
                     # Verify check_password still exists with original name
                     with anyio.fail_after(MCP_CALL_TIMEOUT):
-                        result2 = await session.call_tool('get_funcs', {
+                        result2 = await session.call_tool('funcs', {
                             'items': ['check_password'],
                         })
                     assert not result2.isError
@@ -837,8 +837,8 @@ class TestSetPrototypeTool:
         if check_addr is None:
             pytest.skip("check_password address not found")
 
-        # Step 1: get current signature via get_funcs
-        info = mcp_call(fresh_headless_server, 'get_funcs', {
+        # Step 1: get current signature via funcs
+        info = mcp_call(fresh_headless_server, 'funcs', {
             'items': ['check_password'],
         })
         data_info = parse_json_response(info)
@@ -856,7 +856,7 @@ class TestSetPrototypeTool:
             assert data[0].get('error') is None
 
         # Step 3: verify function still exists
-        after = mcp_call(fresh_headless_server, 'get_funcs', {
+        after = mcp_call(fresh_headless_server, 'funcs', {
             'items': ['check_password'],
         })
         assert 'check_password' in after
@@ -918,45 +918,55 @@ class TestPatchTool:
 # ---------------------------------------------------------------------------
 
 class TestTypesTool:
-    """Tool: types — pattern?, offset?, limit?
+    """Tool: list(entry_type='type') — lists user-defined types from the TIL.
 
-    IDA-specific: types() returns only user-defined/loaded named types from the
+    IDA-specific: types are only user-defined/loaded named types from the
     local TIL — primitive types (int, char, void) are language keywords and are
     NOT listed here. For crackme.elf the local TIL contains only ELF struct
     definitions. Use type_info() to look up primitives by name.
+
+    The standalone `types` tool was folded into list(entry_type='type') in
+    scope B. These tests call the new surface; `pattern` was renamed to
+    `match_filter` and the response is a ListResult envelope (JSON text).
     """
 
     def test_types_returns_non_empty_list(self, headless_server):
-        """types() returns a non-empty list of named types."""
-        result = mcp_call(headless_server, 'types', {
+        """list(entry_type='type') returns type entries."""
+        result = mcp_call(headless_server, 'list', {
+            'entry_type': 'type',
             'offset': 0,
             'limit': 50,
         })
-        assert len(result) > 0
-        # The crackme.elf TIL contains ELF struct types
+        assert result is not None
+        # The crackme.elf TIL contains ELF struct types; keywords appear in JSON
         assert any(kw in result for kw in ('struct', 'kind', 'name', 'Elf'))
 
     def test_types_with_pattern_filter(self, headless_server):
-        """types(pattern='Elf') returns ELF-related types from crackme.elf TIL."""
-        result = mcp_call(headless_server, 'types', {
-            'pattern': 'Elf',
+        """list(entry_type='type', match_filter='Elf') returns ELF-related types."""
+        result = mcp_call(headless_server, 'list', {
+            'entry_type': 'type',
+            'match_filter': 'Elf',
             'offset': 0,
             'limit': 20,
         })
-        assert 'Elf' in result or len(result) == 0  # May be empty if no ELF types
+        # May be empty if no ELF types; 'No Types found' appears in summary
+        assert 'Elf' in result or 'No Types found' in result
 
     def test_types_pagination(self, headless_server):
-        """types with offset pagination returns different results."""
-        result_page0 = mcp_call(headless_server, 'types', {
+        """list(entry_type='type') with offset pagination returns different results."""
+        result_page0 = mcp_call(headless_server, 'list', {
+            'entry_type': 'type',
             'offset': 0,
             'limit': 5,
         })
-        result_page1 = mcp_call(headless_server, 'types', {
+        result_page1 = mcp_call(headless_server, 'list', {
+            'entry_type': 'type',
             'offset': 5,
             'limit': 5,
         })
-        # Pages should be different (unless fewer than 5 types total, unlikely)
-        assert result_page0 != result_page1 or len(result_page0) == 0
+        # Pages always differ (page_info.offset differs in JSON); edge-case: fewer
+        # than 5 types total → both pages say 'No Types found' (identical text)
+        assert result_page0 != result_page1 or 'No Types found' in result_page0
 
 
 # ---------------------------------------------------------------------------

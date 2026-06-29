@@ -9,7 +9,6 @@ import functools
 import logging
 import queue as _queue_module
 import socket
-import struct
 import sys
 from threading import (
     RLock,
@@ -44,8 +43,12 @@ from mcp.server.fastmcp.exceptions import ToolError
 from sse_starlette.sse import AppStatus
 import uvicorn
 
+from .portspec import (
+    bind_listen_socket,
+    parse_port_spec,
+    resolve_port_spec,
+)
 from .util import (
-    find_next_available_port,
     is_headless,
 )
 
@@ -278,7 +281,7 @@ class McpServer:
     def __init__(
         self,
         host: str = '',
-        port: int = 0,
+        port: int | None = None,
     ) -> None:
         logger.info('McpServer init Started')
 
@@ -302,7 +305,7 @@ class McpServer:
             for handler in self._watchers:
                 handler(self, self.state)
 
-    def start(self, host: str | None = None, port: int | None = None) -> None:
+    def start(self, host: str | None = None, port: int | str | None = None) -> None:
         if self._server_thread is None:
             self._update_state(McpServerState.STARTING)
 
@@ -313,27 +316,19 @@ class McpServer:
             self._app, self._mcp = create_mcp_app(get_port=lambda: self.port)
 
             host = host or self.host
-            port = (
-                port or self.port or find_next_available_port(port or self.port or 6150)
-            )
+            # Resolve port candidates: explicit start() arg, else this server's
+            # configured port, else the default parallel-safe range — so the GUI
+            # plugin (no port) and mcpyida-headless share one default.
+            port = resolve_port_spec(port, self.port)
+            candidates = parse_port_spec(port)
 
-            logger.info(f'Starting MCP Server on {host}:{port}')
+            logger.info(f'Starting MCP Server on {host} (port spec: {port})')
             self.host = host
-            self.port = port
 
-            # Create socket with SO_REUSEADDR and SO_LINGER to allow immediate port reuse
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # SO_LINGER with 0 timeout forces immediate socket close (no TIME_WAIT)
-            self._socket.setsockopt(
-                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
-            )
-            self._socket.bind((host, port))
-            self.port = self._socket.getsockname()[
-                1
-            ]  # Read actual port (supports --port 0)
-            self._socket.listen(100)
-            self._socket.setblocking(False)
+            # Bind the first free port in the candidate list, auto-incrementing
+            # past conflicts so parallel instances don't clash. bind_listen_socket
+            # sets SO_REUSEADDR + SO_LINGER and does bind + listen + setblocking.
+            self._socket, self.port = bind_listen_socket(host, candidates)
 
             # Don't pass host/port to config when providing pre-bound sockets
             config = uvicorn.Config(self._app, log_level='info', lifespan='on')
@@ -347,6 +342,11 @@ class McpServer:
                 if datetime.now() - req_time > timedelta(seconds=1):
                     logger.error('Timed out waiting for server to start.')
                     self.stop()
+                    # Clear the port: the socket bound but uvicorn never came up,
+                    # so the server is NOT serving. Leaving the bound port set
+                    # would make headless emit a false "ready"; None makes its
+                    # `port is None` guard fire a structured `internal` error.
+                    self.port = None
                     return
             print(f'MCP Server started: http://{self.host}:{self.port}/mcp')
             self._update_state(McpServerState.RUNNING)

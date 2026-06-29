@@ -4,8 +4,8 @@ Launch IDA headless via idalib, open a binary, run auto-analysis,
 and start the MCP server. Blocks until interrupted.
 
 Usage:
-    mcpyida-headless --binary /path/to/elf [--host 127.0.0.1] [--port 6150]
-    python -m mcpyida.headless --binary /path/to/elf
+    mcpyida-headless /path/to/elf [--host 127.0.0.1] [--port 6150-6159] [--ida-dir DIR]
+    python -m mcpyida.headless /path/to/elf
 
 Prints JSON readiness signal to stdout when the server is ready:
     {"status": "ready", "host": "127.0.0.1", "port": 6150, "binary": "/path/to/elf"}
@@ -18,8 +18,8 @@ Requires idapro pip package (idalib).
 from __future__ import annotations
 
 import argparse
-import json
 import os
+import platform
 import queue
 import sys
 import threading
@@ -53,14 +53,23 @@ def run_on_main_thread(func, *args, **kwargs):
     return result_holder[0]
 
 
+def _idalib_filename() -> str:
+    """Platform name of the idalib shared library (per idapro/__init__.py)."""
+    system = platform.system()
+    if system == 'Windows':
+        return 'idalib.dll'
+    if system == 'Darwin':
+        return 'libidalib.dylib'
+    return 'libidalib.so'
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='MCPyIDA headless MCP server',
     )
     parser.add_argument(
-        '--binary',
-        required=True,
-        help='Path to binary file to analyze',
+        'binary',
+        help='Path to the binary file to analyze.',
     )
     parser.add_argument(
         '--host',
@@ -69,9 +78,13 @@ def main() -> None:
     )
     parser.add_argument(
         '--port',
-        type=int,
-        default=6150,
-        help='Port for MCP server (default: 6150, 0 for auto-assign)',
+        type=str,
+        default='6150-6159',
+        help='Port for the MCP server. A range "N-M" (default 6150-6159) binds '
+        'the first free port in the range — safe for launching multiple '
+        'instances in parallel. A bare "N" is strict (only that port; fails if '
+        'busy). "0" lets the OS auto-assign. The actual bound port is reported '
+        'in the JSON ready signal.',
     )
     parser.add_argument(
         '--idb-path',
@@ -80,16 +93,45 @@ def main() -> None:
         "'-o' so the .i64/.idb is written here instead of beside the binary "
         '(idalib has no db-path arg otherwise). Default: beside the binary.',
     )
+    parser.add_argument(
+        '--ida-dir',
+        default=None,
+        help='Path to the IDA Pro install directory (the one containing '
+        'libidalib.so). Precedence: --ida-dir > $IDADIR > '
+        '~/.idapro/ida-config.json (py-activate-idalib). If unset and idalib is '
+        'not configured, the server exits with a clear structured error.',
+    )
     args = parser.parse_args()
+
+    from mcpyida import cli_status
+    from mcpyida.portspec import parse_port_spec
 
     binary_path = Path(args.binary).resolve()
     if not binary_path.exists():
-        print(f'Error: binary not found: {binary_path}', file=sys.stderr)
-        sys.exit(1)
+        sys.exit(
+            cli_status.emit_error(
+                'binary_not_found',
+                f'binary not found: {binary_path}',
+                remediation=f'Check the path. Given: {args.binary!r}',
+            )
+        )
 
-    # Resolve --idb-path now (before the expensive idalib import) so bad input
-    # fails fast. IDA splits the '-o' argument string on whitespace, so a path
-    # containing spaces is silently mis-parsed into multiple args — reject it.
+    # Validate --port now (before the expensive idalib import) so bad input
+    # fails fast. The actual bind happens in McpServer.start.
+    try:
+        parse_port_spec(args.port)
+    except ValueError as e:
+        sys.exit(
+            cli_status.emit_error(
+                'bad_port',
+                f'invalid --port {args.port!r}: {e}',
+                remediation='Use a single port "N", a range "N-M", or "0".',
+            )
+        )
+
+    # Resolve --idb-path now (before the idalib import). IDA splits the '-o'
+    # argument on whitespace, so a path with spaces is mis-parsed — reject it.
+    # (Pure usage error: keep argparse's exit 2.)
     idb_path = None
     if args.idb_path:
         idb_path = str(Path(args.idb_path).expanduser())
@@ -99,53 +141,42 @@ def main() -> None:
                 f'argument on spaces): {idb_path!r}'
             )
 
-    # Check prerequisites before expensive imports.
-    #
-    # Headless mode is built on idalib, which was introduced in IDA Pro 9.0.
-    # The `idapro` module does NOT exist in IDA 7.x/8.x — on older IDA, use the
-    # GUI plugin (`mcpyida_install`) instead of headless mode.
+    # Pin the IDA install if requested. idalib reads $IDADIR at `import idapro`
+    # time (it overrides the JSON config), so set it before importing idapro.
+    if args.ida_dir:
+        ida_dir = Path(args.ida_dir).expanduser()
+        libname = _idalib_filename()
+        if not ida_dir.is_dir() or not any(ida_dir.rglob(libname)):
+            sys.exit(
+                cli_status.emit_error(
+                    'missing_install_dir',
+                    f'--ida-dir does not contain {libname}: {ida_dir}',
+                    remediation=(
+                        f'Pass the IDA install dir that contains {libname}, or '
+                        f'set IDADIR. Searched: {ida_dir}'
+                    ),
+                )
+            )
+        os.environ['IDADIR'] = str(ida_dir)
+
+    # Check prerequisites before expensive imports. Headless mode is built on
+    # idalib (IDA Pro 9.0+); the `idapro` module does NOT exist in IDA 7.x/8.x.
     try:
         import idapro
     except ImportError as e:
-        error_msg = str(e)
-        if 'libidalib' in error_msg or 'py-activate-idalib' in error_msg:
-            # idapro is importable but idalib has not been activated yet.
-            print(
-                'Error: idalib is not configured.\n'
-                '\n'
-                'Headless mode requires IDA Pro 9.0 or later (idalib). The idapro\n'
-                'module is present but idalib has not been activated in this\n'
-                'environment. Activate it by running the script shipped with IDA,\n'
-                'in the SAME virtual environment used to run mcpyida-headless:\n'
-                '  python /path/to/ida-pro-9/idalib/python/py-activate-idalib.py\n'
-                '\n'
-                'Full setup:\n'
-                '  1. Install IDA Pro 9.0+ (https://hex-rays.com). idalib does not\n'
-                '     exist in IDA 7.x/8.x — use the GUI plugin there instead.\n'
-                '  2. Run py-activate-idalib.py (writes ~/.idapro/ida-config.json)\n'
-                '     in the same venv as mcpyida-headless.\n'
-                '  3. pip install mcpyida\n'
-                '  4. mcpyida-headless --binary /path/to/elf',
-                file=sys.stderr,
+        searched = os.environ.get('IDADIR') or '~/.idapro/ida-config.json'
+        sys.exit(
+            cli_status.emit_error(
+                'missing_install_dir',
+                f'could not import idapro (idalib): {e}',
+                remediation=(
+                    'Headless mode requires IDA Pro 9.0+ with idalib activated. '
+                    'Pass --ida-dir <dir>, set IDADIR, or run '
+                    'py-activate-idalib.py in this venv. '
+                    f'Searched: {searched}. See docs/installation.md.'
+                ),
             )
-        else:
-            # The idapro module itself is missing — typically IDA older than 9.0,
-            # or idalib not installed/activated in this environment.
-            print(
-                f'Error: could not import idapro (idalib): {e}\n'
-                '\n'
-                'Headless mode requires IDA Pro 9.0 or later. idalib and its\n'
-                'idapro module were introduced in IDA 9.0 and do NOT exist in\n'
-                'IDA 7.x or 8.x. On older IDA, use the GUI plugin (mcpyida_install)\n'
-                'instead of headless mode.\n'
-                '\n'
-                'If you do have IDA Pro 9.0+, activate idalib in this environment:\n'
-                '  python /path/to/ida-pro-9/idalib/python/py-activate-idalib.py\n'
-                '\n'
-                'See docs/installation.md for full setup.',
-                file=sys.stderr,
-            )
-        sys.exit(1)
+        )
 
     # Signal headless mode before importing mcpserver so that is_headless()
     # returns True immediately, even if idalib doesn't set the batch flag.
@@ -160,8 +191,23 @@ def main() -> None:
     try:
         idapro.open_database(str(binary_path), run_auto_analysis=True, args=open_args)
     except Exception as e:
-        print(f'Error: Failed to open binary: {e}', file=sys.stderr)
-        sys.exit(1)
+        sys.exit(cli_status.emit_error('open_failed', f'failed to open binary: {e}'))
+
+    # Echo the resolved install/version/binary (item 4). The bound port is not
+    # known until the server binds (after analysis); it is in the ready JSON.
+    try:
+        # idapro re-exports get_ida_install_dir from idapro.config in its
+        # __init__, so reach it via the package (no submodule import — keeps
+        # mypy happy: `idapro` is ignore_missing_imports, `idapro.config` isn't).
+        _ver = idapro.get_library_version()  # (major, minor, build) or None
+        _ver_s = '.'.join(str(x) for x in _ver) if _ver else 'unknown'
+        _install = idapro.get_ida_install_dir() or 'unknown'
+    except Exception:
+        _ver_s, _install = 'unknown', 'unknown'
+    print(
+        f'Using IDA {_ver_s} ({_install}) · binary {binary_path.name}',
+        file=sys.stderr,
+    )
 
     # Persist the database on SIGTERM. The `finally: close_database()` below saves
     # on graceful exit (KeyboardInterrupt/normal), but a default SIGTERM terminates
@@ -203,23 +249,26 @@ def main() -> None:
         # Use McpServer for lifecycle management (threading, sockets, ports).
         # McpServer.start() calls server.create_mcp_app() internally.
         server = McpServer()
-        server.start(args.host, args.port)
+        try:
+            server.start(args.host, args.port)
+        except OSError as e:
+            sys.exit(
+                cli_status.emit_error(
+                    'port_unavailable',
+                    f'could not bind a port for --port {args.port!r}: {e}',
+                    remediation='Pass a --port range (e.g. 6150-6159) or omit --port.',
+                )
+            )
 
         actual_port = server.port
         if actual_port is None or actual_port <= 0:
-            print(
-                f'Error: server port not assigned (got {actual_port!r})',
-                file=sys.stderr,
+            sys.exit(
+                cli_status.emit_error(
+                    'internal', f'server port not assigned (got {actual_port!r})'
+                )
             )
-            sys.exit(1)
 
-        status = {
-            'status': 'ready',
-            'host': args.host,
-            'port': actual_port,
-            'binary': str(binary_path),
-        }
-        print(json.dumps(status), flush=True)
+        cli_status.emit_ready(args.host, actual_port, str(binary_path))
 
         # Pump the IDA main-thread work queue.
         #

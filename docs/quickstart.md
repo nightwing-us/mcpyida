@@ -49,7 +49,7 @@ python -c "import idapro; print('idalib activated')"
 Still within the same activated venv, start MCPyIDA with a binary to analyze:
 
 ```bash
-mcpyida-headless --binary /path/to/firmware.elf
+mcpyida-headless /path/to/firmware.elf
 ```
 
 Expected output:
@@ -158,19 +158,20 @@ The server will stop gracefully.
 The `mcpyida-headless` command accepts these flags:
 
 ```bash
-mcpyida-headless --binary <path> [--host <host>] [--port <port>]
+mcpyida-headless <binary> [--host <host>] [--port <spec>] [--ida-dir <dir>]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--binary` (required) | — | Path to the binary to analyze |
+| `binary` (positional, required) | — | Path to the binary to analyze |
 | `--host` | `127.0.0.1` | Host to bind the server (localhost by default) |
-| `--port` | `6150` | Port number (use `0` for automatic assignment) |
+| `--port` | `6150-6159` | Port number, range (first free), or `0` for OS auto-assign |
+| `--ida-dir` | auto | IDA install dir (overrides `IDADIR` env and `~/.idapro/ida-config.json`) |
 
 Example: auto-assign port and bind to all interfaces:
 
 ```bash
-mcpyida-headless --binary /path/to/firmware.elf --host 0.0.0.0 --port 0
+mcpyida-headless /path/to/firmware.elf --host 0.0.0.0 --port 0
 ```
 
 The readiness JSON will show the actual assigned port.
@@ -198,7 +199,7 @@ python /path/to/ida-pro-9.2/idalib/python/py-activate-idalib.py
 python -c "import idapro; print('OK')"
 
 # Then run the server in the same venv
-mcpyida-headless --binary /path/to/firmware.elf
+mcpyida-headless /path/to/firmware.elf
 ```
 
 ### "idapro" module import fails or version mismatch
@@ -242,7 +243,7 @@ curl http://127.0.0.1:6150/mcp
 Analysis of large binaries can take minutes. Wait longer or use a smaller test binary:
 
 ```bash
-mcpyida-headless --binary /bin/ls
+mcpyida-headless /bin/ls
 ```
 
 On the first run after idalib activation, IDA may perform one-time setup operations, which can take several minutes.

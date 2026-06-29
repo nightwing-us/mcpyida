@@ -66,6 +66,7 @@ from mcpyida.rpc_types import (
 )
 from mcpyida.tools import analysis, core, modify, scripting, search
 from mcpyida.tools import types as type_tools
+from mcpyida.dispatch import single_or_batch, unwrap
 
 
 logger = logging.getLogger(__name__)
@@ -839,7 +840,7 @@ class McpToolRegistration:
             ('list_entries', 'list', {'readOnlyHint': True}, True),
             ('cursor', 'cursor', {'readOnlyHint': True}, True),
             ('context', 'context', {'readOnlyHint': True}, True),
-            ('get_funcs', 'get_funcs', {'readOnlyHint': True}, True),
+            ('funcs', 'funcs', {'readOnlyHint': True}, True),
             # Analysis read-only tools
             ('decompile', 'decompile', {'readOnlyHint': True}, True),
             ('disasm', 'disasm', {'readOnlyHint': True}, True),
@@ -854,7 +855,6 @@ class McpToolRegistration:
             ('patch', 'patch', {'destructiveHint': True}, False),
             # begin_trans/end_trans omitted — IDA has no explicit transactions
             # Type tools
-            ('types', 'types', {'readOnlyHint': True}, True),
             ('type_info', 'type_info', {'readOnlyHint': True}, True),
             ('create_struct', 'create_struct', {}, False),
             ('add_field', 'add_field', {}, False),
@@ -877,7 +877,7 @@ class McpToolRegistration:
             Field(
                 description=(
                     'Type of entry to list. '
-                    'Valid values: function, memory_segment, import, export, string, class, namespace'
+                    'Valid values: function, memory_segment, import, export, string, class, namespace, type'
                 )
             ),
         ],
@@ -891,7 +891,7 @@ class McpToolRegistration:
             str,
             Field(
                 description=(
-                    'Optional substring filter on the name (functions and strings only)'
+                    'Optional substring filter on the name (functions, strings, and types only)'
                 )
             ),
         ] = '',
@@ -900,13 +900,14 @@ class McpToolRegistration:
 
         RETURNS: ListResult with items[], page_info (has_more, next_offset), total_count
 
-        VALID entry_type VALUES: function, memory_segment, import, export, string, class, namespace
+        VALID entry_type VALUES: function, memory_segment, import, export, string, class, namespace, type
 
         EXAMPLES:
         - list(entry_type='function') -> first 500 functions
         - list(entry_type='function', limit=50) -> first 50 functions
         - list(entry_type='function', offset=100, limit=50) -> functions 100-149
-        - list(entry_type='string', match_filter='error', limit=20) -> strings containing 'error'"""
+        - list(entry_type='string', match_filter='error', limit=20) -> strings containing 'error'
+        - list(entry_type='type', match_filter='stream') -> types matching 'stream'"""
         # entry_type is validated by FastMCP from the JSON-schema enum at
         # request time; cast here to match core.list_entries' Literal type.
         return await core.list_entries(
@@ -938,139 +939,240 @@ class McpToolRegistration:
         - application: RE application name and version"""
         return await core.context()
 
-    async def get_funcs(
+    async def funcs(
         self,
         items: Annotated[
-            list[str],
+            list[str] | None,
             Field(
                 description=(
-                    'Addresses or names of functions to look up. '
-                    'Each entry is a hex address (e.g. "0x401000") or a function name.'
+                    'Batch mode: list of addresses or function names. For one function, '
+                    'omit items and pass target directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        target: Annotated[
+            str | None, Field(description='Single mode: hex address or function name.')
+        ] = None,
     ) -> Any:
-        """Get function info by address or name. Accepts a list of addresses or names.
+        """Get function info by address or name.
 
-        RETURNS: list of dicts, each with name, entrypoint, signature (on success) or error (on failure)."""
-        return await core.get_funcs(items)
+        Single: pass target directly (returns one result).
+        Batch: pass items=[...] (returns a list).
+
+        RETURNS: a dict (single call) or list of dicts (batch), each with name,
+        entrypoint, signature (on success) or error (on failure)."""
+        items, single = single_or_batch(
+            items,
+            {'target': target},
+            kind='scalar',
+            empty_hint='list(entry_type="function")',
+        )
+        return unwrap(await core.get_funcs(items), single)
 
     # --- Analysis tools ---
 
     async def decompile(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Functions to decompile. Each item: {addr?: str, name?: str}. '
-                    'Provide addr (hex) or name per item.'
+                    'Batch mode: list of {addr?, name?}. For a single function, omit '
+                    'items and pass addr/name directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        addr: Annotated[
+            str | None, Field(description='Single mode: function address (hex).')
+        ] = None,
+        name: Annotated[
+            str | None, Field(description='Single mode: function name.')
+        ] = None,
     ) -> Any:
         """Decompile function(s). Returns C pseudocode with function comment prepended.
 
-        RETURNS: list of dicts, each with:
+        Single: pass addr/name directly (returns one result).
+        Batch: pass items=[{addr?, name?}, ...] (returns a list).
+
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - code: decompiled C pseudocode (on success)
         - name: resolved function name
         - entrypoint: function entry point (hex)
         - error: null on success, error message on failure"""
-        return await analysis.decompile(items)
+        items, single = single_or_batch(
+            items,
+            {'addr': addr, 'name': name},
+            kind='dict',
+            empty_hint='list(entry_type="function")',
+        )
+        return unwrap(await analysis.decompile(items), single)
 
     async def disasm(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Disassembly requests. Each item: {addr?: str, name?: str, count?: int}. '
-                    'count set -> address mode (N instructions from addr). '
-                    'name -> function mode. '
-                    'addr only -> auto-detect (function containing addr, or 20 instructions).'
+                    'Batch mode: list of {addr?, name?, count?}. For one target, omit '
+                    'items and pass addr/name/count directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        addr: Annotated[
+            str | None, Field(description='Single mode: address (hex).')
+        ] = None,
+        name: Annotated[
+            str | None, Field(description='Single mode: function name.')
+        ] = None,
+        count: Annotated[
+            int | None,
+            Field(description='Single mode: instruction count (address mode).'),
+        ] = None,
     ) -> Any:
-        """Disassemble function(s) or address ranges. MERGED from disassemble_function + disassemble_addr.
+        """Disassemble function(s) or address ranges.
 
-        RETURNS: list of dicts, each with:
+        Single: pass addr/name/count directly (returns one result).
+        Batch: pass items=[...] (returns a list).
+
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - asm: disassembly text (on success)
         - addr: resolved address
         - name: function name (if function mode)
         - mode: 'function' or 'address'
         - error: null on success, error message on failure"""
-        return await analysis.disasm(items)
+        items, single = single_or_batch(
+            items,
+            {'addr': addr, 'name': name, 'count': count},
+            kind='dict',
+            empty_hint='list(entry_type="function")',
+        )
+        return unwrap(await analysis.disasm(items), single)
 
     async def symbols(
         self,
         items: Annotated[
-            list[str],
+            list[str] | None,
             Field(
                 description=(
-                    'Hex addresses to look up symbols for (e.g. ["0x401000", "0x402000"])'
+                    'Batch mode: list of hex addresses. For one address, omit items and '
+                    'pass addr directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        addr: Annotated[
+            str | None, Field(description='Single mode: hex address.')
+        ] = None,
     ) -> Any:
-        """Get symbol info for address(es). Batch: accepts list of hex addresses.
+        """Get symbol info for address(es).
 
-        RETURNS: list of dicts, each with:
+        Single: pass addr directly (returns one result).
+        Batch: pass items=[...] (returns a list).
+
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - addr: input address
         - name: symbol name (on success)
         - symbol_type: one of function, code_label, global_variable, data_label, unknown
         - error: null on success, error message on failure"""
-        return await analysis.symbols(items)
+        items, single = single_or_batch(
+            items,
+            {'addr': addr},
+            kind='scalar',
+            empty_hint='list(entry_type="function")',
+        )
+        return unwrap(await analysis.symbols(items), single)
 
     async def xrefs(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Cross-reference requests. Each item: '
-                    '{target: str, direction?: "to"|"from", offset?: int, limit?: int}. '
-                    'target is a hex address or function name.'
+                    'Batch mode: list of {target, direction?, offset?, limit?}. For one '
+                    'target, omit items and pass target/direction/offset/limit directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        target: Annotated[
+            str | None, Field(description='Single mode: hex address or function name.')
+        ] = None,
+        direction: Annotated[
+            str | None, Field(description='Single mode: "to" (default) or "from".')
+        ] = None,
+        offset: Annotated[
+            int | None, Field(description='Single mode: pagination start.')
+        ] = None,
+        limit: Annotated[
+            int | None, Field(description='Single mode: max results.')
+        ] = None,
     ) -> Any:
-        """Find cross-references to/from addresses or functions. MERGED from xrefs_to + xrefs_from.
+        """Find cross-references to/from addresses or functions.
 
-        RETURNS: list of dicts, each with:
+        Single: pass target (and optional direction/offset/limit) directly.
+        Batch: pass items=[...] (returns a list).
+
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - result: ListResult with cross-reference items (on success)
         - error: null on success, error message on failure"""
-        return await analysis.xrefs(items)
+        items, single = single_or_batch(
+            items,
+            {
+                'target': target,
+                'direction': direction,
+                'offset': offset,
+                'limit': limit,
+            },
+            kind='dict',
+            empty_hint='list(entry_type="function")',
+        )
+        return unwrap(await analysis.xrefs(items), single)
 
     # --- Modify tools ---
 
     async def rename(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Symbol rename requests. Each item: '
-                    '{new_name: str, addr?: str, name?: str}. '
-                    'Provide addr (hex) or name to identify the symbol.'
+                    'Batch mode: list of {new_name, addr?, name?}. For one symbol, omit '
+                    'items and pass new_name plus addr/name directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        new_name: Annotated[
+            str | None, Field(description='Single mode: new symbol name.')
+        ] = None,
+        addr: Annotated[
+            str | None, Field(description='Single mode: symbol address (hex).')
+        ] = None,
+        name: Annotated[
+            str | None, Field(description='Single mode: current symbol name.')
+        ] = None,
         ctx: Context | None = None,
     ) -> Any:
-        """Rename symbol(s). Each item: {new_name, addr?, name?}. Batched with per-item errors.
+        """Rename symbol(s). THIS MODIFIES THE IDA DATABASE.
 
-        THIS MODIFIES THE IDA DATABASE.
+        Single: pass new_name plus addr/name directly (returns one result).
+        Batch: pass items=[...] (returns a list).
 
-        RETURNS: list of dicts, each with:
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - addr: resolved hex address
         - old_name: previous symbol name
         - new_name: new name applied
         - error: null on success, error message on failure"""
+        items, single = single_or_batch(
+            items, {'new_name': new_name, 'addr': addr, 'name': name}, kind='dict'
+        )
         token = _current_mcp_context.set(ctx)
         _ida_batch_state.clear()
         try:
-            return await modify.rename(items)
+            return unwrap(await modify.rename(items), single)
         finally:
             _current_mcp_context.reset(token)
             _ida_batch_state.clear()
@@ -1115,19 +1217,37 @@ class McpToolRegistration:
     async def set_comments(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Comment set requests. Each item: '
-                    '{comment: str, kind?: "disasm"|"decompiler"|"function"|"both", '
-                    'addr?: str, name?: str, line?: int}. '
-                    'kind="both" (default) sets disasm EOL comment at addr; also decompiler comment if line given.'
+                    'Batch mode: list of {comment, kind?, addr?, name?, line?}. For one '
+                    'comment, omit items and pass the fields directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        comment: Annotated[
+            str | None, Field(description='Single mode: comment text.')
+        ] = None,
+        kind: Annotated[
+            str | None,
+            Field(description='Single mode: "disasm"|"decompiler"|"function"|"both".'),
+        ] = None,
+        addr: Annotated[
+            str | None, Field(description='Single mode: address (hex).')
+        ] = None,
+        name: Annotated[
+            str | None, Field(description='Single mode: function name.')
+        ] = None,
+        line: Annotated[
+            int | None, Field(description='Single mode: decompiler line.')
+        ] = None,
         ctx: Context | None = None,
     ) -> Any:
-        """Set comment(s). MERGED 3-in-1. Each item: {comment, kind?, addr?, name?, line?}
+        """Set comment(s). THIS MODIFIES THE IDA DATABASE.
+
+        Single: pass comment plus kind/addr/name/line directly (returns one result).
+        Batch: pass items=[...] (returns a list).
 
         kind values:
         - 'disasm'     -> EOL comment at addr (requires addr)
@@ -1135,11 +1255,23 @@ class McpToolRegistration:
         - 'function'   -> plate comment on function (requires addr or name)
         - 'both'       (default) -> disasm comment at addr; ALSO decompiler comment if line provided
 
-        RETURNS: list of dicts, each with kind, addr, message (on success) or error (on failure)"""
+        RETURNS: a dict (single call) or list of dicts (batch), each with kind,
+        addr, message (on success) or error (on failure)."""
+        items, single = single_or_batch(
+            items,
+            {
+                'comment': comment,
+                'kind': kind,
+                'addr': addr,
+                'name': name,
+                'line': line,
+            },
+            kind='dict',
+        )
         token = _current_mcp_context.set(ctx)
         _ida_batch_state.clear()
         try:
-            return await modify.set_comments(items)
+            return unwrap(await modify.set_comments(items), single)
         finally:
             _current_mcp_context.reset(token)
             _ida_batch_state.clear()
@@ -1147,51 +1279,78 @@ class McpToolRegistration:
     async def get_comment(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Functions to get comments for. Each item: {addr?: str, name?: str}.'
+                    'Batch mode: list of {addr?, name?}. For one function, omit items '
+                    'and pass addr/name directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        addr: Annotated[
+            str | None, Field(description='Single mode: function address (hex).')
+        ] = None,
+        name: Annotated[
+            str | None, Field(description='Single mode: function name.')
+        ] = None,
     ) -> Any:
-        """Get function plate comment(s). Batched: each item {addr?, name?}.
+        """Get function plate comment(s).
 
-        RETURNS: list of dicts, each with:
+        Single: pass addr/name directly (returns one result).
+        Batch: pass items=[...] (returns a list).
+
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - name: function name
         - addr: function entry point address
         - comment: plate comment text (may be empty string)
         - error: null on success, error message on failure"""
-        return await modify.get_comment(items)
+        items, single = single_or_batch(
+            items,
+            {'addr': addr, 'name': name},
+            kind='dict',
+            empty_hint='list(entry_type="function")',
+        )
+        return unwrap(await modify.get_comment(items), single)
 
     async def set_prototype(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Function prototype set requests. Each item: '
-                    '{addr: str, prototype: str}. '
-                    'prototype is a C-style signature, e.g. "int main(int argc, char **argv)".'
+                    'Batch mode: list of {addr, prototype}. For one function, omit items '
+                    'and pass addr/prototype directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        addr: Annotated[
+            str | None, Field(description='Single mode: function address (hex).')
+        ] = None,
+        prototype: Annotated[
+            str | None, Field(description='Single mode: C-style signature.')
+        ] = None,
         ctx: Context | None = None,
     ) -> Any:
-        """Set function prototype(s). Each item: {addr, prototype}. Batched.
+        """Set function prototype(s). THIS MODIFIES THE IDA DATABASE.
 
-        THIS MODIFIES THE IDA DATABASE.
+        Single: pass addr/prototype directly (returns one result).
+        Batch: pass items=[...] (returns a list).
 
         The old signature is saved in the function comment for reference.
 
-        RETURNS: list of dicts, each with:
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - addr: function address
         - name: function name
         - error: null on success, error message on failure"""
+        items, single = single_or_batch(
+            items, {'addr': addr, 'prototype': prototype}, kind='dict'
+        )
         token = _current_mcp_context.set(ctx)
         _ida_batch_state.clear()
         try:
-            return await modify.set_prototype(items)
+            return unwrap(await modify.set_prototype(items), single)
         finally:
             _current_mcp_context.reset(token)
             _ida_batch_state.clear()
@@ -1199,26 +1358,36 @@ class McpToolRegistration:
     async def patch(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Patch requests. Each item: '
-                    '{addr: str, hex_bytes: str}. '
-                    'hex_bytes is the new instruction bytes as a hex string, e.g. "90" for NOP.'
+                    'Batch mode: list of {addr, hex_bytes}. For one patch, omit items '
+                    'and pass addr/hex_bytes directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        addr: Annotated[
+            str | None, Field(description='Single mode: address (hex).')
+        ] = None,
+        hex_bytes: Annotated[
+            str | None, Field(description='Single mode: new bytes as hex.')
+        ] = None,
     ) -> Any:
-        """Overwrite bytes at address(es) to modify instruction(s). Batched.
+        """Overwrite bytes at address(es). THIS MODIFIES THE IDA DATABASE.
 
-        THIS MODIFIES THE IDA DATABASE.
+        Single: pass addr/hex_bytes directly (returns one result).
+        Batch: pass items=[...] (returns a list).
 
         BEHAVIOR: Clears existing code unit, writes bytes, re-disassembles.
 
-        RETURNS: list of dicts, each with:
+        RETURNS: a dict (single call) or list of dicts (batch), each with:
         - addr: patched address
         - error: null on success, error message on failure"""
-        return await modify.patch(items)
+        items, single = single_or_batch(
+            items, {'addr': addr, 'hex_bytes': hex_bytes}, kind='dict'
+        )
+        return unwrap(await modify.patch(items), single)
 
     async def begin_trans(
         self,
@@ -1258,49 +1427,37 @@ class McpToolRegistration:
 
     # --- Type tools ---
 
-    async def types(
-        self,
-        pattern: Annotated[
-            str | None,
-            Field(
-                description=(
-                    'Substring filter (case-insensitive). Strips * if glob-style sent. Default: no filter.'
-                )
-            ),
-        ] = None,
-        offset: Annotated[
-            int, Field(description='Pagination offset (default 0)', ge=0)
-        ] = 0,
-        limit: Annotated[
-            int, Field(description='Maximum results to return (default 500)', ge=1)
-        ] = 500,
-    ) -> Any:
-        """Enumerate and search available types across all type sources. Paginated.
-
-        RETURNS: list[TypeSummary] with name, full_path, type_string, kind, size
-
-        EXAMPLES:
-        - types() -> first 500 types
-        - types(pattern="stream", limit=100) -> search for stream-related types
-        - types(offset=50, limit=50) -> next page"""
-        return await type_tools.types(pattern=pattern, offset=offset, limit=limit)
-
     async def type_info(
         self,
         items: Annotated[
-            list[str],
+            list[str] | None,
             Field(
                 description=(
-                    'Type names to look up. Each entry is a short name or full path.'
+                    'Batch mode: list of type names. For one type, omit items and pass '
+                    'type_name directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        type_name: Annotated[
+            str | None,
+            Field(description='Single mode: type name (short or full path).'),
+        ] = None,
     ) -> Any:
-        """Get detailed type info. Batched: accepts list of type names.
+        """Get detailed type info.
 
-        RETURNS: list of dicts, each with TypeDetails fields (on success) or
-        {target, error} on failure."""
-        return await type_tools.type_info(items)
+        Single: pass type_name directly (returns one result).
+        Batch: pass items=[...] (returns a list).
+
+        RETURNS: a dict (single call) or list of dicts (batch), each with
+        TypeDetails fields (on success) or {target, error} on failure."""
+        items, single = single_or_batch(
+            items,
+            {'type_name': type_name},
+            kind='scalar',
+            empty_hint='list(entry_type="type")',
+        )
+        return unwrap(await type_tools.type_info(items), single)
 
     async def create_struct(
         self,
@@ -1340,22 +1497,53 @@ class McpToolRegistration:
     async def add_field(
         self,
         items: Annotated[
-            list[dict],
+            list[dict] | None,
             Field(
                 description=(
-                    'Field addition requests. Each item: '
-                    '{struct_name: str, field_name: str, field_type: str, offset: int, comment?: str}.'
+                    'Batch mode: list of {struct_name, field_name, field_type, offset, '
+                    'comment?}. For one field, omit items and pass the fields directly.'
                 )
             ),
-        ],
+        ] = None,
+        *,
+        struct_name: Annotated[
+            str | None, Field(description='Single mode: structure name.')
+        ] = None,
+        field_name: Annotated[
+            str | None, Field(description='Single mode: field name.')
+        ] = None,
+        field_type: Annotated[
+            str | None, Field(description='Single mode: field type.')
+        ] = None,
+        offset: Annotated[
+            int | None, Field(description='Single mode: field offset.')
+        ] = None,
+        comment: Annotated[
+            str | None, Field(description='Single mode: field comment.')
+        ] = None,
     ) -> Any:
-        """Add field(s) to struct(s). Batched.
+        """Add field(s) to struct(s). THIS MODIFIES THE IDA DATABASE.
+
+        Single: pass struct_name/field_name/field_type/offset directly (returns one result).
+        Batch: pass items=[...] (returns a list).
 
         If a field already exists at the specified offset, it will be replaced.
         If the structure is not large enough, it will be expanded automatically.
 
-        RETURNS: list of dicts with FieldAdditionResult fields."""
-        return await type_tools.add_field(items)
+        RETURNS: a dict (single call) or list of dicts (batch) with
+        FieldAdditionResult fields."""
+        items, single = single_or_batch(
+            items,
+            {
+                'struct_name': struct_name,
+                'field_name': field_name,
+                'field_type': field_type,
+                'offset': offset,
+                'comment': comment,
+            },
+            kind='dict',
+        )
+        return unwrap(await type_tools.add_field(items), single)
 
     # --- Scripting tools ---
 
@@ -1636,9 +1824,9 @@ def build_instructions() -> str:
         arch_line = 'Architecture: unknown'
 
     tools = (
-        'list, cursor, context, get_funcs, decompile, disasm, symbols, xrefs, '
+        'list, cursor, context, funcs, decompile, disasm, symbols, xrefs, '
         'rename, update_vars, set_comments, get_comment, set_prototype, patch, '
-        'begin_trans, end_trans, types, type_info, create_struct, add_field, '
+        'begin_trans, end_trans, type_info, create_struct, add_field, '
         'idapython, find_bytes, find_insns, cfg, callgraph'
     )
 
@@ -2033,7 +2221,7 @@ def register_resources(
     # --- Types (paginated) ---
 
     async def _res_types(offset: int = 0, limit: int = 500) -> Any:
-        return await type_tools.types(offset=offset, limit=limit)
+        return await core.list_entries(entry_type='type', offset=offset, limit=limit)
 
     _register(
         'ida://types/{offset}/{limit}',

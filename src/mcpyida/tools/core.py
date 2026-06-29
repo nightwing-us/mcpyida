@@ -511,15 +511,16 @@ async def list_entries(
     - entry_type: Type of entry to list
     - offset: Starting position for pagination (default 0)
     - limit: Maximum results to return (default 500)
-    - match_filter: Substring filter (only works for function, string types)
+    - match_filter: Substring filter (only works for function, string, type types)
 
-    VALID entry_type VALUES: function, memory_segment, import, export, string, class, namespace
+    VALID entry_type VALUES: function, memory_segment, import, export, string, class, namespace, type
 
     EXAMPLES:
     - list(entry_type='function') -> first 500 functions
     - list(entry_type='function', limit=50) -> first 50 functions
     - list(entry_type='function', offset=100, limit=50) -> functions 100-149
-    - list(entry_type='string', match_filter='error', limit=20) -> first 20 strings containing 'error'"""
+    - list(entry_type='string', match_filter='error', limit=20) -> first 20 strings containing 'error'
+    - list(entry_type='type', match_filter='stream') -> types matching 'stream'"""
     offset = int(offset) if offset else 0
     if offset < 0:
         raise ToolError('offset must be non-negative')
@@ -545,6 +546,12 @@ async def list_entries(
         return await run_on_ida_main_async(_list_classes_sync, offset, limit)
     elif entry_type == 'namespace':
         return await run_on_ida_main_async(_list_namespaces_sync, offset, limit)
+    elif entry_type == 'type':
+        from mcpyida.tools.types import _list_types_sync
+
+        return await run_on_ida_main_async(
+            _list_types_sync, offset, limit, match_filter
+        )
     else:
         raise ToolError(f'Unsupported entry type: {entry_type}')
 

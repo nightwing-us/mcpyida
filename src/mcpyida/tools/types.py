@@ -17,6 +17,7 @@ from mcpyida.mcpserver import run_on_ida_main_async
 from mcpyida.models import (
     EnumValue,
     FieldAdditionResult,
+    ListResult,
     MemberInfo,
     StructureCreationResult,
     StructureFieldInput,
@@ -271,18 +272,14 @@ def _add_field_to_struct_impl(udt_data: Any, field: StructureFieldInput) -> None
 # ---------------------------------------------------------------------------
 
 
-def _types_sync(
-    pattern: str | None = None,
-    offset: int = 0,
-    limit: int = 500,
-) -> list[TypeSummary]:
-    """Sync implementation of types — runs on IDA main thread."""
-    import ida_typeinf
+def _collect_types_sync(pattern: str | None = None) -> list[TypeSummary]:
+    """Collect all type matches — runs on IDA main thread.
 
-    if offset < 0:
-        raise ToolError('offset must be non-negative')
-    if limit <= 0:
-        raise ToolError('limit must be positive')
+    Returns the full (unpaginated) sorted list of TypeSummary objects that
+    match the optional pattern substring filter.  Callers apply their own
+    pagination on top of the result.
+    """
+    import ida_typeinf
 
     local_til = ida_typeinf.get_idati()
     if not local_til:
@@ -327,36 +324,31 @@ def _types_sync(
             )
 
     results.sort(key=lambda s: s.name.lower())
-    total = len(results)
-    end = min(offset + limit, total)
-    return results[offset:end]
+    return results
 
 
-async def types(
-    pattern: str | None = None,
+def _list_types_sync(
     offset: int = 0,
     limit: int = 500,
-) -> list[TypeSummary]:
-    """Enumerate and search available types across all type sources. Paginated (not batched).
+    match_filter: str = '',
+) -> ListResult:
+    """Enumerate types as a standard ListResult envelope (scope B)."""
+    # Lazy import to avoid a potential circular import at module load time.
+    from mcpyida.tools.core import _tool_result_list_formatter
 
-    RETURNS: list[TypeSummary] with name, full_path, type_string, kind, size
+    matched = _collect_types_sync(match_filter or None)
 
-    PARAMETERS:
-    - pattern: Substring filter (case-insensitive, strips * characters)
-    - offset: Starting index for pagination (default 0)
-    - limit: Maximum number of results (default 500)
+    def _proc(ts: TypeSummary) -> dict:
+        return {
+            'type': 'type',
+            'name': ts.name,
+            'full_path': ts.full_path,
+            'type_string': ts.type_string,
+            'kind': ts.kind,
+            'size': ts.size,
+        }
 
-    USE CASE: Discover available types before setting variable types.
-
-    NOTES:
-    - Searches across ALL loaded type libraries (local types + imported TILs like mssdk, gnulnx)
-    - full_path includes TIL name for disambiguation (e.g., "mssdk64/HANDLE")
-
-    EXAMPLE:
-    - types() -> first 500 types from all loaded TILs
-    - types(pattern="stream", limit=100) -> search for stream-related types
-    - types(offset=50, limit=50) -> next page of results"""
-    return await run_on_ida_main_async(_types_sync, pattern, offset, limit)
+    return _tool_result_list_formatter('Types', 'type', _proc, matched, offset, limit)
 
 
 async def type_info(

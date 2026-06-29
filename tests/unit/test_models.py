@@ -154,7 +154,7 @@ class TestListResult:
             offset=0, limit=10, num_returned=0, total_count=0, has_more=False
         )
         for etype in ('function', 'memory_segment', 'import', 'export',
-                      'string', 'class', 'namespace', 'cross-reference'):
+                      'string', 'class', 'namespace', 'cross-reference', 'type'):
             lr = ListResult(
                 summary='',
                 entry_type=etype,

@@ -30,7 +30,12 @@ _IDA_MODULES = [
     'ida_segment',
     'ida_typeinf',
     'idc',
-    'idapro',
+    # idapro is intentionally NOT stubbed here. headless.py imports it lazily
+    # inside main(), and unit tests that reach that path (test_good_ida_dir_*
+    # etc.) rely on `import idapro` failing naturally so the structured
+    # missing_install_dir error is emitted. mcpserver.py wraps its own
+    # module-level `import idapro` in try/except, so removing it from stubs
+    # does not break any other unit test.
 ]
 
 

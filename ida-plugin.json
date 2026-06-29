@@ -1,0 +1,39 @@
+{
+  "$schema": "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json",
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "mcpyida",
+    "version": "0.7.2",
+    "entryPoint": "mcpyida_plugin.py",
+    "license": "Apache-2.0",
+    "description": "MCP server exposing IDA Pro reverse-engineering capabilities to LLM clients. Headless mode is available via `pip install mcpyida` (IDA Pro 9.0+).",
+    "authors": [
+      {
+        "name": "Eric Lin",
+        "email": "17968842+anselor@users.noreply.github.com"
+      }
+    ],
+    "urls": {
+      "repository": "https://github.com/nightwing-us/mcpyida"
+    },
+    "pythonDependencies": [
+      "mcpyida==0.7.2"
+    ],
+    "idaVersions": [
+      "9.0",
+      "9.1",
+      "9.2"
+    ],
+    "categories": [
+      "api-scripting-and-automation",
+      "integration-with-third-parties-interoperability"
+    ],
+    "keywords": [
+      "mcp",
+      "llm",
+      "reverse-engineering",
+      "ai",
+      "decompiler"
+    ]
+  }
+}

@@ -40,6 +40,7 @@ EntryTypes = Literal[
     'class',
     'namespace',
     'cross-reference',
+    'type',
 ]
 
 SymbolTypes = Literal[

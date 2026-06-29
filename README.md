@@ -42,6 +42,20 @@ pip install mcpyida
 mcpyida_install
 ```
 
+### Alternative: IDA Plugin Manager (IDA Pro 9.0+)
+
+If you run IDA Pro 9.0 or newer, you can install the GUI plugin via the
+Hex-Rays [IDA Plugin Manager](https://hex-rays.com/blog/introducing-the-ida-plugin-manager)
+instead of steps 2–3:
+
+```bash
+hcli plugin install mcpyida
+```
+
+This pulls the `mcpyida` package from PyPI and registers the plugin loader
+automatically. Headless mode is not installed this way — use `pip install
+mcpyida` (see below) for headless/idalib usage.
+
 ### 4. Configure IDA to use your virtual environment
 
 Point IDA's IDAPython at the same virtual environment.  The exact steps depend
@@ -65,7 +79,7 @@ Launch the MCP server without the IDA GUI (requires idalib):
 
 ```bash
 export IDADIR=/path/to/idapro
-mcpyida-headless --binary /path/to/firmware.elf
+mcpyida-headless /path/to/firmware.elf
 ```
 
 The server prints a JSON readiness signal to stdout:

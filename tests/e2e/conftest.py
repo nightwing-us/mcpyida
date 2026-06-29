@@ -66,7 +66,7 @@ def headless_server(request):
     proc = subprocess.Popen(
         [
             sys.executable, '-m', 'mcpyida.headless',
-            '--binary', CRACKME_ELF,
+            CRACKME_ELF,
             '--port', '0',
         ],
         stdout=subprocess.PIPE,
@@ -114,8 +114,7 @@ def fresh_headless_server(request):
             os.remove(f)
 
     proc = subprocess.Popen(
-        [sys.executable, '-m', 'mcpyida.headless',
-         '--binary', CRACKME_ELF, '--port', '0'],
+        [sys.executable, '-m', 'mcpyida.headless', CRACKME_ELF, '--port', '0'],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -162,8 +161,7 @@ def struct_test_server(request):
             os.remove(f)
 
     proc = subprocess.Popen(
-        [sys.executable, '-m', 'mcpyida.headless',
-         '--binary', STRUCT_TEST_ELF, '--port', '0'],
+        [sys.executable, '-m', 'mcpyida.headless', STRUCT_TEST_ELF, '--port', '0'],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,

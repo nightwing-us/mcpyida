@@ -143,6 +143,23 @@ In GUI mode, MCPyIDA runs as a plugin inside IDA Pro while you use the interacti
 
 For more details on configuring IDAPython, see the [IDA Pro documentation](https://hex-rays.com/products/ida/support/idadoc/) or the official [IDAPython Getting Started guide](https://docs.hex-rays.com/developer/idapython/idapython-getting-started).
 
+#### IDA Plugin Manager (IDA Pro 9.0+)
+
+On IDA Pro 9.0+, the GUI plugin can be installed through the Hex-Rays IDA
+Plugin Manager, which is built into HCLI:
+
+```bash
+hcli plugin install mcpyida
+```
+
+The manager reads MCPyIDA's `ida-plugin.json`, installs the `mcpyida` package
+from PyPI (resolving `fastapi`, `mcp`, and `asgi-lifespan`), and drops the
+plugin loader into your IDA `plugins/` directory. Use `hcli plugin
+upgrade mcpyida` / `hcli plugin uninstall mcpyida` to manage it.
+
+This path installs the **GUI plugin only**. Headless mode (idalib) is always
+installed via `pip install mcpyida` as described above.
+
 ### Headless Mode (Scripting / idalib — IDA 9.0+ Only)
 
 In headless mode, MCPyIDA runs without the IDA GUI using the idalib Python API. This is useful for automated analysis pipelines and is the recommended approach for most users.
@@ -176,7 +193,7 @@ In headless mode, MCPyIDA runs without the IDA GUI using the idalib Python API. 
 
 5. Launch the headless server:
    ```bash
-   mcpyida-headless --binary /path/to/firmware.elf
+   mcpyida-headless /path/to/firmware.elf
    ```
 
 The server will print a JSON readiness signal to stdout:
@@ -194,7 +211,7 @@ The server will print a JSON readiness signal to stdout:
 Create a simple binary or use an existing one:
 
 ```bash
-mcpyida-headless --binary /bin/ls
+mcpyida-headless /bin/ls
 ```
 
 You should see output like:
@@ -278,7 +295,7 @@ If you activated idalib in one venv but later try to run `mcpyida-headless` in a
 ```bash
 # Wrong: activated idalib in Python 3.13
 # but now running with Python 3.12
-python3.12 mcpyida-headless --binary /path/to/elf
+python3.12 mcpyida-headless /path/to/elf
 ```
 
 **Solution:** Always use the same venv and Python version:
@@ -289,7 +306,7 @@ source ~/idavenv/bin/activate
 # Verify it's the one where you activated idalib
 python --version
 # Now run the server
-mcpyida-headless --binary /path/to/elf
+mcpyida-headless /path/to/elf
 ```
 
 ### Error: Binary file not found
@@ -306,13 +323,13 @@ ls -la /path/to/firmware.elf
 If the default port 6150 is already in use, specify a different port:
 
 ```bash
-mcpyida-headless --binary /path/to/firmware.elf --port 6151
+mcpyida-headless /path/to/firmware.elf --port 6151
 ```
 
 Or use `--port 0` for automatic port assignment:
 
 ```bash
-mcpyida-headless --binary /path/to/firmware.elf --port 0
+mcpyida-headless /path/to/firmware.elf --port 0
 ```
 
 The server will print the actual port in the JSON readiness signal.
@@ -364,7 +381,7 @@ On the first run after idalib activation, IDA may perform one-time setup operati
 **Solution:** Wait longer, or test with a very small binary first:
 
 ```bash
-mcpyida-headless --binary /bin/ls
+mcpyida-headless /bin/ls
 ```
 
 Once the first analysis completes, subsequent analyses should be faster.

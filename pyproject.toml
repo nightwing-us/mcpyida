@@ -39,6 +39,9 @@ dev = [
     "black>=23.0.0",
     "isort>=5.12.0",
     "ruff>=0.0.270",
+    # Hex-Rays CLI — provides `hcli plugin lint` to validate ida-plugin.json
+    # against the IDA Plugin Manager before publishing.
+    "ida-hcli>=0.18",
 ]
 
 [project.scripts]

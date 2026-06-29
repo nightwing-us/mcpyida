@@ -60,7 +60,6 @@ def server():
         begin_trans,
         end_trans,
     )
-    from mcpyida.tools.types import types as types_tool, type_info, create_struct, add_field
 
     # Build a compatibility shim that maps the old McpServer method names to
     # the new standalone tool function signatures. The integration tests call

@@ -48,6 +48,8 @@ class TestHeadlessLaunch:
 
 
 async def _mcp_call(url: str, tool_name: str, arguments: dict) -> str:
+    error_msg: str | None = None
+    text_result: str = ''
     async with streamablehttp_client(url) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -57,15 +59,18 @@ async def _mcp_call(url: str, tool_name: str, arguments: dict) -> str:
                 error_texts = [
                     item.text for item in result.content if hasattr(item, 'text')
                 ]
-                raise AssertionError(
+                error_msg = (
                     f"MCP tool '{tool_name}' returned error: {' '.join(error_texts)}"
                 )
-            texts = [
-                item.text
-                for item in result.content
-                if hasattr(item, 'text')
-            ]
-            return '\n'.join(texts)
+            else:
+                text_result = '\n'.join(
+                    item.text for item in result.content if hasattr(item, 'text')
+                )
+    # Raised OUTSIDE all TaskGroup contexts so anyio cannot wrap it in an
+    # ExceptionGroup (which would defeat pytest.raises(AssertionError, ...)).
+    if error_msg is not None:
+        raise AssertionError(error_msg)
+    return text_result
 
 
 def mcp_call(server_status: dict, tool_name: str, arguments: dict) -> str:
