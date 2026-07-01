@@ -20,6 +20,24 @@ from tests.conftest import CRACKME_ELF
 from tests.integration.helpers import _run_async
 
 
+def _xref_flat_to_listresult(flat: dict) -> object:
+    """Adapt a flat xrefs item (the standardized contract) back into a
+    ListResult for the per-direction xref test helpers.
+
+    xrefs returns a flat per-item dict (rows under ``items``, no ``['result']``
+    wrapper). These adapters present the merged tool in the old per-direction
+    ListResult shape the integration tests were written against.
+    """
+    from mcpyida.models import ListResult
+
+    fields = {
+        k: flat[k]
+        for k in ('summary', 'entry_type', 'schema_version', 'page_info', 'items')
+        if k in flat
+    }
+    return ListResult(**fields)
+
+
 def _clean_stale_ida_files(binary_path: str) -> None:
     """Remove stale IDA database files next to binary_path."""
     directory = os.path.dirname(binary_path)
@@ -135,25 +153,25 @@ def server():
         )
 
     def _mcp_find_xrefs_to_addr(addr: str = '', limit: int = 500) -> object:
-        result = _run_async(xrefs, [{'target': addr, 'direction': 'to', 'limit': limit}])
+        result = _run_async(xrefs, [{'addr': addr, 'direction': 'to', 'limit': limit}])
         if result and result[0].get('error'):
             from mcp.server.fastmcp.exceptions import ToolError
             raise ToolError(result[0]['error'])
-        return result[0]['result'] if result else None
+        return _xref_flat_to_listresult(result[0]) if result else None
 
     def _mcp_find_xrefs_from_addr(addr: str = '', limit: int = 500) -> object:
-        result = _run_async(xrefs, [{'target': addr, 'direction': 'from', 'limit': limit}])
+        result = _run_async(xrefs, [{'addr': addr, 'direction': 'from', 'limit': limit}])
         if result and result[0].get('error'):
             from mcp.server.fastmcp.exceptions import ToolError
             raise ToolError(result[0]['error'])
-        return result[0]['result'] if result else None
+        return _xref_flat_to_listresult(result[0]) if result else None
 
     def _mcp_find_xrefs_to_func(name: str = '', limit: int = 500) -> object:
-        result = _run_async(xrefs, [{'target': name, 'direction': 'to', 'limit': limit}])
+        result = _run_async(xrefs, [{'name': name, 'direction': 'to', 'limit': limit}])
         if result and result[0].get('error'):
             from mcp.server.fastmcp.exceptions import ToolError
             raise ToolError(result[0]['error'])
-        return result[0]['result'] if result else None
+        return _xref_flat_to_listresult(result[0]) if result else None
 
     def _mcp_get_function_comment(name: str = '', addr: str = '') -> str:
         result = _run_async(get_comment, [{'name': name, 'addr': addr}])

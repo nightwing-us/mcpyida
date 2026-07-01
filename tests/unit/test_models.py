@@ -34,6 +34,8 @@ from mcpyida.models import (
     SymbolInfo,
     TypeDetails,
     TypeSummary,
+    VarUpdate,
+    VarUpdateReport,
 )
 
 
@@ -294,6 +296,15 @@ class TestStructureCreationResult:
         )
         assert r.created is False
 
+    def test_error_field_present_and_defaults_none(self):
+        """Carries the shared `error` key (None here — create_struct raises on
+        failure) so its shape is uniform with the other result models."""
+        r = StructureCreationResult(
+            name='MyStruct', size=16, created=True, message='ok'
+        )
+        assert r.error is None
+        assert 'error' in r.model_dump()
+
 
 class TestFieldAdditionResult:
     def test_success(self):
@@ -321,6 +332,105 @@ class TestFieldAdditionResult:
             message='Type not found',
         )
         assert r.success is False
+
+    def test_error_field_defaults_to_none(self):
+        """Every batched-item result must carry a top-level `error` key
+        (None on success) to match the shared tool contract."""
+        r = FieldAdditionResult(
+            struct_name='MyStruct',
+            field_name='count',
+            offset=0,
+            size=4,
+            success=True,
+            message='Field added',
+        )
+        assert r.error is None
+        assert 'error' in r.model_dump()
+
+    def test_error_field_carries_message_on_failure(self):
+        r = FieldAdditionResult(
+            struct_name='MyStruct',
+            field_name='bad_field',
+            offset=0,
+            size=0,
+            success=False,
+            message='Type not found',
+            error='Type not found',
+        )
+        assert r.error == 'Type not found'
+
+    def test_error_auto_derived_from_message_when_not_success(self):
+        """A failure result with no explicit error derives error from message,
+        so every failed item exposes the contract `error` key without each
+        construction site having to set it."""
+        r = FieldAdditionResult(
+            struct_name='MyStruct',
+            field_name='bad_field',
+            offset=0,
+            size=0,
+            success=False,
+            message='Failed to rebuild struct',
+        )
+        assert r.error == 'Failed to rebuild struct'
+
+    def test_error_stays_none_on_success_even_with_message(self):
+        r = FieldAdditionResult(
+            struct_name='MyStruct',
+            field_name='count',
+            offset=0,
+            size=4,
+            success=True,
+            message='Field added successfully',
+        )
+        assert r.error is None
+
+
+class TestVarUpdateModels:
+    """Structured result for update_vars (replaces the old prose status string)."""
+
+    def test_var_update_minimal(self):
+        v = VarUpdate(var='v1')
+        assert v.var == 'v1'
+        assert v.new_name is None
+        assert v.new_type is None
+        assert v.error is None
+
+    def test_var_update_full(self):
+        v = VarUpdate(var='v1', new_name='buffer', new_type='char *')
+        assert v.new_name == 'buffer'
+        assert v.new_type == 'char *'
+        assert v.error is None
+
+    def test_var_update_error_carries_message(self):
+        v = VarUpdate(var='x', new_name='y', error="Variable not found in function 'main'")
+        assert v.error == "Variable not found in function 'main'"
+
+    def test_report_shape_matches_contract(self):
+        r = VarUpdateReport(
+            function='main',
+            addr='0x401136',
+            results=[
+                VarUpdate(var='v1', new_name='buffer', new_type='char *'),
+                VarUpdate(var='a1', new_name='argc'),
+            ],
+        )
+        d = r.model_dump()
+        assert d['function'] == 'main'
+        assert d['addr'] == '0x401136'
+        assert d['error'] is None
+        assert d['results'][0] == {
+            'var': 'v1',
+            'new_name': 'buffer',
+            'new_type': 'char *',
+            'error': None,
+        }
+        assert d['results'][1]['new_type'] is None
+
+    def test_report_function_level_error(self):
+        r = VarUpdateReport(function='nope', error='Function not found: nope')
+        assert r.results == []
+        assert r.addr is None
+        assert r.error == 'Function not found: nope'
 
 
 class TestBinaryContext:

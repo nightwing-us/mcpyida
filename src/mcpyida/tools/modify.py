@@ -24,6 +24,10 @@ from mcpyida.mcpserver import (
     is_headless,
     run_on_ida_main_async,
 )
+from mcpyida.models import (
+    VarUpdate,
+    VarUpdateReport,
+)
 from mcpyida.tools.core import (
     _get_func_ea,
     _get_function,
@@ -153,7 +157,7 @@ def _rename_one_sync(new_name: str, addr: str, name: str, batch_state: dict) -> 
 async def update_vars(
     function_name: str,
     variables_to_update: Dict[str, Dict[str, str]],
-) -> str:
+) -> dict:
     """Rename/retype variables in a function. Keeps existing dict-of-dicts interface.
 
     THIS MODIFIES THE IDA DATABASE.
@@ -171,53 +175,63 @@ async def update_vars(
         }
       )
 
-    RETURNS: Per-variable status report."""
+    RETURNS: a dict {function, addr, results, error} where each item of
+    ``results`` is {var, new_name, new_type, error} (error None on success). A
+    function-level failure (e.g. function not found) sets the top-level ``error``
+    and leaves ``results`` empty."""
     if not variables_to_update:
-        return 'ERROR: No variables were provided to update'
-    return await run_on_ida_main_async(
+        return VarUpdateReport(
+            function=function_name,
+            error='No variables were provided to update',
+        ).model_dump()
+    report = await run_on_ida_main_async(
         _update_vars_impl_sync, function_name, variables_to_update
     )
+    return report.model_dump()
 
 
 def _update_vars_impl_sync(
     function_name: str,
     variables_to_update: Dict[str, Dict[str, str]],
-) -> str:
+) -> VarUpdateReport:
     """Implementation of update_vars (must run in IDA main thread with write lock)."""
-    func = _get_function(name=function_name)
-    aggregate_status: list[str] = []
+    try:
+        func = _get_function(name=function_name)
+    except Exception as e:
+        return VarUpdateReport(function=function_name, error=str(e))
 
+    results: list[VarUpdate] = []
     for var_name, new_vals in variables_to_update.items():
         new_name = new_vals.get('new_name', None)
         new_type = new_vals.get('new_type', None)
+        item = VarUpdate(var=var_name, new_name=new_name, new_type=new_type)
 
         lvar = func.locals.get(var_name)
         if not lvar:
-            aggregate_status.append(
-                f'{var_name}: Variable not found in function {function_name!r}.'
-            )
+            item.error = f'Variable not found in function {function_name!r}.'
+            results.append(item)
             continue
 
         existing_var = func.locals.get(new_name) if new_name else None
-        if lvar and not existing_var:
-            try:
-                if new_name:
-                    lvar.name = new_name
-                if new_type:
-                    lvar.type = new_type
-            except Exception as e:
-                tb = traceback.format_exc()
-                aggregate_status.append(f'{var_name}: ERROR: {e}\n{tb}')
-            else:
-                aggregate_status.append(f'{var_name}: Done')
-        else:
-            aggregate_status.append(f'{var_name}: Variable {new_name} already exists.')
+        if existing_var:
+            item.error = f'Variable {new_name} already exists.'
+            results.append(item)
+            continue
 
-    conclusion_msg = (
-        f'Results from updating {len(variables_to_update)} function variables:\n'
+        try:
+            if new_name:
+                lvar.name = new_name
+            if new_type:
+                lvar.type = new_type
+        except Exception as e:
+            item.error = f'{e}\n{traceback.format_exc()}'
+        results.append(item)
+
+    return VarUpdateReport(
+        function=function_name,
+        addr=f'{func.addr:#x}',
+        results=results,
     )
-    conclusion_msg += '\n'.join(aggregate_status)
-    return conclusion_msg
 
 
 # ---------------------------------------------------------------------------

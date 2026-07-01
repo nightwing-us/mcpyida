@@ -358,13 +358,14 @@ async def type_info(
 
     Each item in items is a type name (short name or full path like 'mssdk64/HANDLE').
 
-    RETURNS: list of dicts, each with TypeDetails fields (on success) or
+    RETURNS: list of dicts, each with TypeDetails fields and error=None (on
+    success) or
     - target, error: input target and error message (on failure)"""
     results: list[dict] = []
     for type_name in items:
         try:
             details = await run_on_ida_main_async(_get_type_info_one_sync, type_name)
-            results.append(details.model_dump())
+            results.append({**details.model_dump(), 'error': None})
         except Exception as e:
             results.append({'target': type_name, 'error': str(e)})
     return results

@@ -3,6 +3,48 @@
 All notable changes to **MCPyIDA** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.3] - 2026-06-29
+
+Tool-surface consistency. Several tools that deviated from the shared
+input/output convention are brought in line, so the API is uniform to call:
+one address key (`addr`), one result/row shape, and a top-level `error` on
+every batched item.
+
+### Changed (breaking)
+
+- **`list` items use `addr`** (was `address`) for the per-entry address, matching
+  every other tool. Segment-style entries keep `start`/`end`.
+- **`xrefs` is addressed like its siblings.** Input now takes `addr`/`name`
+  (aliases: `ea`, `function`, and the legacy `target`, auto-detected) instead of
+  `target`-only. Output is a flat per-item dict — cross-reference rows under
+  `items` with `error` at the top level — instead of nesting a `ListResult` under
+  `['result']`. The `ida://xrefs/*` resources return the flat shape.
+- **`find_bytes` / `find_insns` rows are under `items`** (was `matches`), matching
+  the row-container key the rest of the surface uses.
+- **`update_vars` returns a structured result** (was a human-readable status
+  string): `{function, addr, results, error}`, where each item of `results` is
+  `{var, new_name, new_type, error}` (`error` null on success). A function-level
+  failure sets the top-level `error` with empty `results`. Per-variable
+  success/failure is now machine-readable.
+
+### Added
+
+- **`add_field` items carry a top-level `error` key** (None on success, the
+  failure message otherwise), so every batched-item result follows the shared
+  `error` convention. `success`/`message` are unchanged.
+- **`type_info` success items carry `error: None`**, so every batched item — not
+  just failures — exposes the shared `error` key.
+- **`StructureCreationResult` carries a top-level `error` key** (None on success;
+  `create_struct` raises on failure), making its shape uniform with the other
+  result models.
+
+### Notes
+
+- `BasicBlock.address` and `FunctionInfo.entrypoint` are intentionally **not**
+  renamed — external tools depend on those model definitions. `entrypoint`
+  remains the accepted "function entry point" key (`decompile`, `funcs`,
+  `FunctionInfo`); `BasicBlock.address` remains the CFG block key.
+
 ## [0.7.2] - 2026-06-26
 
 Single-or-batch tool calls, parallel-safe port binding, and headless launcher

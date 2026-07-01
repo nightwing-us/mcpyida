@@ -1091,14 +1091,24 @@ class McpToolRegistration:
             list[dict] | None,
             Field(
                 description=(
-                    'Batch mode: list of {target, direction?, offset?, limit?}. For one '
-                    'target, omit items and pass target/direction/offset/limit directly.'
+                    'Batch mode: list of {addr|name, direction?, offset?, limit?}. For '
+                    'one target, omit items and pass addr/name/direction/offset/limit '
+                    'directly.'
                 )
             ),
         ] = None,
         *,
+        addr: Annotated[
+            str | None, Field(description='Single mode: hex address.')
+        ] = None,
+        name: Annotated[
+            str | None, Field(description='Single mode: function name.')
+        ] = None,
         target: Annotated[
-            str | None, Field(description='Single mode: hex address or function name.')
+            str | None,
+            Field(
+                description='Single mode: legacy alias for addr/name (auto-detected).'
+            ),
         ] = None,
         direction: Annotated[
             str | None, Field(description='Single mode: "to" (default) or "from".')
@@ -1112,15 +1122,20 @@ class McpToolRegistration:
     ) -> Any:
         """Find cross-references to/from addresses or functions.
 
-        Single: pass target (and optional direction/offset/limit) directly.
+        Single: pass addr or name (and optional direction/offset/limit) directly.
         Batch: pass items=[...] (returns a list).
 
-        RETURNS: a dict (single call) or list of dicts (batch), each with:
-        - result: ListResult with cross-reference items (on success)
+        RETURNS: a dict (single call) or list of dicts (batch), each a flat dict
+        (no ['result'] wrapper) with:
+        - addr: resolved address (hex); name: echoed when provided
+        - direction: 'to' or 'from'
+        - items: cross-reference rows (plus summary, entry_type, page_info)
         - error: null on success, error message on failure"""
         items, single = single_or_batch(
             items,
             {
+                'addr': addr,
+                'name': name,
                 'target': target,
                 'direction': direction,
                 'offset': offset,
@@ -1205,7 +1220,9 @@ class McpToolRegistration:
             }
           )
 
-        RETURNS: Per-variable status report."""
+        RETURNS: a dict {function, addr, results, error}, where each item of
+        `results` is {var, new_name, new_type, error} (error null on success).
+        A function-level failure sets the top-level `error` with empty `results`."""
         token = _current_mcp_context.set(ctx)
         _ida_batch_state.clear()
         try:
@@ -1657,7 +1674,7 @@ class McpToolRegistration:
 
         RETURNS: list of dicts per pattern, each with:
         - pattern: the input pattern string
-        - matches: list of {addr, bytes} dicts
+        - items: list of {addr, bytes} dicts
         - has_more: True if results were truncated at limit
         - error: null on success, error message on failure
 
@@ -1700,7 +1717,7 @@ class McpToolRegistration:
 
         RETURNS: list of dicts per sequence, each with:
         - sequence: the input sequence spec
-        - matches: list of {addr, instructions} dicts
+        - items: list of {addr, instructions} dicts
         - has_more: True if results were truncated at limit
         - error: null on success, error message on failure
 
@@ -1826,7 +1843,7 @@ def build_instructions() -> str:
     tools = (
         'list, cursor, context, funcs, decompile, disasm, symbols, xrefs, '
         'rename, update_vars, set_comments, get_comment, set_prototype, patch, '
-        'begin_trans, end_trans, type_info, create_struct, add_field, '
+        'type_info, create_struct, add_field, '
         'idapython, find_bytes, find_insns, cfg, callgraph'
     )
 
@@ -2083,7 +2100,7 @@ def register_resources(
                 name = ida_entry.get_entry_name(ordinal) or f'entry_{ordinal}'
                 entries.append({
                     'ordinal': ordinal,
-                    'address': f'{ea:#x}',
+                    'addr': f'{ea:#x}',
                     'name': name,
                 })
         except Exception:
@@ -2209,7 +2226,8 @@ def register_resources(
         r = results[0]
         if r.get('error') is not None:
             raise ToolError(r['error'])
-        return r.get('result')
+        r.pop('error', None)
+        return r
 
     _register(
         'ida://xrefs/to-func/{identifier}',
@@ -2321,7 +2339,8 @@ def register_resources(
         r = results[0]
         if r.get('error') is not None:
             raise ToolError(r['error'])
-        return r.get('result')
+        r.pop('error', None)
+        return r
 
     _register(
         'ida://xrefs/to/{addr}',
@@ -2337,7 +2356,8 @@ def register_resources(
         r = results[0]
         if r.get('error') is not None:
             raise ToolError(r['error'])
-        return r.get('result')
+        r.pop('error', None)
+        return r
 
     _register(
         'ida://xrefs/from/{addr}',

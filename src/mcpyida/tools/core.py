@@ -228,7 +228,7 @@ def _list_functions_sync(
         return {
             'type': 'function',
             'name': func_name,
-            'address': f'{func_addr:#x}',
+            'addr': f'{func_addr:#x}',
             'signature': sig,
         }
 
@@ -301,7 +301,7 @@ def _list_imports_sync(
         return {
             'type': 'import',
             'name': name,
-            'address': f'{ea:#x}',
+            'addr': f'{ea:#x}',
             'ordinal': ordinal,
         }
 
@@ -347,7 +347,7 @@ def _list_exports_sync(
         return {
             'type': 'export',
             'name': name,
-            'address': f'{ea:#x}',
+            'addr': f'{ea:#x}',
             'symbol_type': sym_type,
         }
 
@@ -380,7 +380,7 @@ def _list_strings_sync(
         return {
             'type': 'string',
             'value': repr(str(s)),
-            'address': f'{s.ea:#x}',
+            'addr': f'{s.ea:#x}',
         }
 
     matching_info = f' matching {repr(match_filter)}' if match_filter else ''
@@ -422,7 +422,7 @@ def _list_classes_sync(
         return {
             'type': 'class',
             'name': fq_name,
-            'address': f'{ea:#x}',
+            'addr': f'{ea:#x}',
         }
 
     return _tool_result_list_formatter(
@@ -469,7 +469,7 @@ def _list_namespaces_sync(
         return {
             'type': 'namespace',
             'name': fq_name,
-            'address': f'{ea:#x}',
+            'addr': f'{ea:#x}',
         }
 
     return _tool_result_list_formatter(

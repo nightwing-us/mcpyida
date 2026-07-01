@@ -26,12 +26,12 @@ class TestListFunctions:
         for item in result.items:
             assert isinstance(item, dict), f'Expected dict, got {type(item).__name__}'
             assert 'name' in item, f'Item missing "name" key: {item!r}'
-            assert 'address' in item, f'Item missing "address" key: {item!r}'
+            assert 'addr' in item, f'Item missing "addr" key: {item!r}'
 
     def test_list_functions_addresses_are_hex(self, server):
         result = server.mcp_list(entry_type='function', offset=0, limit=10)
         for item in result.items:
-            assert_valid_address(item['address'])
+            assert_valid_address(item['addr'])
 
     def test_list_functions_has_page_info(self, server):
         result = server.mcp_list(entry_type='function', offset=0, limit=10)

@@ -3,7 +3,7 @@
   "IDAMetadataDescriptorVersion": 1,
   "plugin": {
     "name": "mcpyida",
-    "version": "0.7.2",
+    "version": "0.7.3",
     "entryPoint": "mcpyida_plugin.py",
     "license": "Apache-2.0",
     "description": "MCP server exposing IDA Pro reverse-engineering capabilities to LLM clients. Headless mode is available via `pip install mcpyida` (IDA Pro 9.0+).",
@@ -17,7 +17,7 @@
       "repository": "https://github.com/nightwing-us/mcpyida"
     },
     "pythonDependencies": [
-      "mcpyida==0.7.2"
+      "mcpyida==0.7.3"
     ],
     "idaVersions": [
       "9.0",

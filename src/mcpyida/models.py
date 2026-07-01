@@ -19,6 +19,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    model_validator,
 )
 
 if sys.version_info >= (3, 12):
@@ -241,6 +242,10 @@ class StructureCreationResult(BaseModel):
     size: int = Field(description='Structure size in bytes')
     created: bool = Field(description='True if newly created, False if already existed')
     message: str = Field(description='Status message')
+    error: str | None = Field(
+        default=None,
+        description='Error message on failure, None otherwise (shared tool contract)',
+    )
 
 
 class FieldAdditionResult(BaseModel):
@@ -252,6 +257,53 @@ class FieldAdditionResult(BaseModel):
     size: int = Field(description='Size of field in bytes')
     success: bool = Field(description='True if field was added successfully')
     message: str = Field(description='Status message or error description')
+    error: str | None = Field(
+        default=None,
+        description='Error message on failure, None on success (shared tool contract)',
+    )
+
+    @model_validator(mode='after')
+    def _derive_error(self) -> 'FieldAdditionResult':
+        # Expose the contract `error` key on every failed item without each
+        # construction site having to set it: derive from message on failure,
+        # force None on success.
+        if self.success:
+            self.error = None
+        elif self.error is None:
+            self.error = self.message
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Variable-update models
+# ---------------------------------------------------------------------------
+
+
+class VarUpdate(BaseModel):
+    """Result of updating a single local variable."""
+
+    var: str = Field(description='Original variable name targeted')
+    new_name: str | None = Field(default=None, description='Requested new name, if any')
+    new_type: str | None = Field(default=None, description='Requested new type, if any')
+    error: str | None = Field(
+        default=None, description='Error message on failure, None on success'
+    )
+
+
+class VarUpdateReport(BaseModel):
+    """Structured result of an update_vars call (per-variable results)."""
+
+    function: str = Field(description='Function whose variables were updated')
+    addr: str | None = Field(
+        default=None, description='Resolved function entry address (hex)'
+    )
+    results: list[VarUpdate] = Field(
+        default_factory=list, description='Per-variable results'
+    )
+    error: str | None = Field(
+        default=None,
+        description='Function-level error (e.g. function not found); None otherwise',
+    )
 
 
 # ---------------------------------------------------------------------------

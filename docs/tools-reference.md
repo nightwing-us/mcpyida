@@ -21,7 +21,7 @@ Authoritative reference for all 25 tools exposed by the MCPyIDA MCP server via S
 - `match_filter` (string, optional, default: ''): Substring filter on entry name (functions and strings only; case-insensitive)
 
 **Returns:** `ListResult` containing:
-- `items[]`: List of entries (each with name, address, and type-specific fields)
+- `items[]`: List of entries (each with name, `addr`, and type-specific fields; segment ranges carry `start`/`end` instead)
 - `page_info`: Pagination state (offset, limit, total_count, has_more, next_offset)
 - `summary`: Human-readable description of the list
 - `entry_type`: The requested type
@@ -176,13 +176,19 @@ disasm(items=[
 
 **Parameters:**
 - `items` (array of dicts, required): Cross-reference requests. Each item:
-  - `target` (string, required): Hex address (e.g., `"0x401000"`) or function name
-  - `direction` (string, optional, default: 'to'): `"to"` (refs pointing to target) or `"from"` (refs from target)
+  - `addr` (hex address) **or** `name` (function name) — addressed like every
+    other tool. Aliases accepted: `ea` (for `addr`), `function` (for `name`), and
+    the legacy `target` (auto-detected: `0x`-prefixed → address, else name).
+  - `direction` (string, optional, default: 'to'): `"to"` (refs pointing to the
+    target) or `"from"` (refs from the target)
   - `offset` (integer, optional, default: 0): Pagination offset
   - `limit` (integer, optional, default: 500): Max results
 
-**Returns:** Array of dicts, each with:
-- `result`: `ListResult` containing cross-reference items (on success)
+**Returns:** Array of flat dicts (the shared items-batched contract — **no
+`['result']` wrapper**), each with:
+- `addr`: resolved address (hex); `name`: echoed when provided
+- `direction`: `"to"` or `"from"`
+- `items`: cross-reference rows (plus `summary`, `entry_type`, `page_info`)
 - `error`: null on success; error message on failure
 
 **Batch-capable:** Yes.
@@ -363,7 +369,12 @@ create_struct(
   - `new_type` (string, optional): New C-style type string
   - At least one of `new_name` or `new_type` per variable
 
-**Returns:** Per-variable status report.
+**Returns:** A structured dict:
+- `function`: function name; `addr`: resolved function entry (hex)
+- `results[]`: one per variable — `{var, new_name, new_type, error}` (`error`
+  null on success, message on per-variable failure)
+- `error`: function-level error (e.g. function not found); null otherwise, with
+  empty `results`
 
 **Example:**
 ```
@@ -557,7 +568,7 @@ idapython(code="x")  # Returns 100, not 10
 
 **Returns:** Array of dicts, one per pattern, each with:
 - `pattern`: Input pattern string
-- `matches`: Array of matching addresses (hex)
+- `items`: Array of matching addresses (hex)
 - `has_more`: Boolean (true if matches exceed limit)
 - `error`: null on success; error message on failure
 
@@ -583,7 +594,7 @@ find_bytes(patterns=["55 48 89 E5", "48 83 EC ??"], offset=10, limit=100)  # mul
 
 **Returns:** Array of dicts, one per sequence, each with:
 - `sequence`: Input sequence description
-- `matches`: Array of matching addresses (hex)
+- `items`: Array of matching addresses (hex)
 - `has_more`: Boolean (true if matches exceed limit)
 - `error`: null on success; error message on failure
 

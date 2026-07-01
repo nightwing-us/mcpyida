@@ -101,7 +101,7 @@ def binary_addresses(headless_server):
     if data and isinstance(data, dict) and 'items' in data:
         for item in data['items']:
             name = item.get('name', '')
-            addr = item.get('address', '')
+            addr = item.get('addr', '')
             if name in ('main', 'check_password'):
                 addr_map[name] = addr
     assert 'main' in addr_map, (
@@ -403,12 +403,12 @@ class TestSymbolsTool:
 # ---------------------------------------------------------------------------
 
 class TestXrefsTool:
-    """Tool: xrefs — items: list of {target, direction?, offset?, limit?}."""
+    """Tool: xrefs — items: list of {addr|name, direction?, offset?, limit?}."""
 
     def test_xrefs_to_check_password(self, headless_server):
         """xrefs to 'check_password' finds callers (main calls it)."""
         result = mcp_call(headless_server, 'xrefs', {
-            'items': [{'target': 'check_password', 'direction': 'to'}],
+            'items': [{'name': 'check_password', 'direction': 'to'}],
         })
         # main calls check_password, so there should be at least one ref
         assert len(result) > 0
@@ -417,22 +417,22 @@ class TestXrefsTool:
     def test_xrefs_from_main(self, headless_server):
         """xrefs from 'main' finds calls including check_password."""
         result = mcp_call(headless_server, 'xrefs', {
-            'items': [{'target': 'main', 'direction': 'from'}],
+            'items': [{'name': 'main', 'direction': 'from'}],
         })
         assert len(result) > 0
 
     def test_xrefs_by_address(self, headless_server, binary_addresses):
-        """xrefs using hex address target."""
+        """xrefs using hex address."""
         check_addr = binary_addresses.get('check_password', binary_addresses['main'])
         result = mcp_call(headless_server, 'xrefs', {
-            'items': [{'target': check_addr, 'direction': 'to'}],
+            'items': [{'addr': check_addr, 'direction': 'to'}],
         })
         assert len(result) > 0
 
     def test_xrefs_with_pagination(self, headless_server):
         """xrefs with offset/limit pagination works."""
         result = mcp_call(headless_server, 'xrefs', {
-            'items': [{'target': 'main', 'direction': 'from', 'offset': 0, 'limit': 5}],
+            'items': [{'name': 'main', 'direction': 'from', 'offset': 0, 'limit': 5}],
         })
         assert len(result) > 0
 
@@ -735,8 +735,13 @@ class TestUpdateVarsTool:
                 original_var: {'new_name': temp_var},
             },
         })
-        # update_vars returns a human-readable status string
-        assert 'Done' in result or 'Results' in result
+        # update_vars returns a structured {function, addr, results, error} dict
+        data = parse_json_response(result)
+        assert data['error'] is None, f'function-level error: {data["error"]}'
+        assert data['results'], 'expected per-variable results'
+        assert all(item['error'] is None for item in data['results']), (
+            f'per-variable errors: {data["results"]}'
+        )
 
         # Step 3: decompile again and verify new name appears
         decomp2 = mcp_call(fresh_headless_server, 'decompile', {
@@ -1289,7 +1294,7 @@ class TestFindBytes:
         assert len(entries) > 0, f'Expected result entries, got empty list from: {result[:200]}'
         entry = entries[0]
         assert entry.get('error') is None, f'find_bytes returned error: {entry.get("error")}'
-        assert len(entry.get('matches', [])) > 0, 'Expected matches for E8 ?? ?? ?? ??'
+        assert len(entry.get('items', [])) > 0, 'Expected matches for E8 ?? ?? ?? ??'
 
     def test_find_no_match(self, headless_server):
         """find_bytes with unlikely pattern returns empty matches."""
@@ -1300,7 +1305,7 @@ class TestFindBytes:
         assert len(entries) > 0, f'Expected result entries, got empty list from: {result[:200]}'
         entry = entries[0]
         assert entry.get('error') is None, f'find_bytes returned error: {entry.get("error")}'
-        assert entry.get('matches') == [], f'Expected no matches, got: {entry.get("matches")}'
+        assert entry.get('items') == [], f'Expected no matches, got: {entry.get("items")}'
 
     def test_find_multiple_patterns(self, headless_server):
         """find_bytes with two patterns returns two result entries."""
@@ -1311,7 +1316,7 @@ class TestFindBytes:
         assert len(entries) == 2, f'Expected 2 entries, got {len(entries)} from: {result[:200]}'
         for entry in entries:
             assert 'pattern' in entry
-            assert 'matches' in entry
+            assert 'items' in entry
             assert 'has_more' in entry
 
 
@@ -1331,7 +1336,7 @@ class TestFindInsns:
         assert len(entries) > 0, f'Expected result entries, got empty list from: {result[:200]}'
         entry = entries[0]
         assert entry.get('error') is None, f'find_insns returned error: {entry.get("error")}'
-        assert len(entry.get('matches', [])) > 0, 'Expected CALL instruction matches'
+        assert len(entry.get('items', [])) > 0, 'Expected CALL instruction matches'
 
     def test_find_no_match(self, headless_server):
         """find_insns with non-existent mnemonic returns empty matches."""
@@ -1342,7 +1347,7 @@ class TestFindInsns:
         assert len(entries) > 0, f'Expected result entries, got empty list from: {result[:200]}'
         entry = entries[0]
         assert entry.get('error') is None, f'find_insns returned error: {entry.get("error")}'
-        assert entry.get('matches') == [], f'Expected no matches, got: {entry.get("matches")}'
+        assert entry.get('items') == [], f'Expected no matches, got: {entry.get("items")}'
 
     def test_find_ret_sequence(self, headless_server):
         """find_insns for RET instruction finds return sites."""
@@ -1353,7 +1358,7 @@ class TestFindInsns:
         assert len(entries) > 0, f'Expected result entries, got empty list from: {result[:200]}'
         entry = entries[0]
         assert entry.get('error') is None, f'find_insns returned error: {entry.get("error")}'
-        assert len(entry.get('matches', [])) > 0, 'Expected RET instruction matches'
+        assert len(entry.get('items', [])) > 0, 'Expected RET instruction matches'
 
 
 # ---------------------------------------------------------------------------
@@ -1386,7 +1391,11 @@ class TestStructPointerType:
                 'a1': {'new_type': f'{struct_name} *'}
             },
         })
-        assert 'Done' in result or 'a1' in result
+        data = parse_json_response(result)
+        assert data['error'] is None, f'function-level error: {data["error"]}'
+        assert all(item['error'] is None for item in data['results']), (
+            f'per-variable errors: {data["results"]}'
+        )
 
         # Step 3: Verify via fresh decompilation (idapython, not cached)
         result = mcp_call(fresh_headless_server, 'idapython', {
@@ -1427,8 +1436,12 @@ class TestLocalVarStructPointer:
                 'p': {'new_type': 'Config *'},
             },
         })
-        assert 'Done' in result or 'p' in result, (
-            f"update_vars did not confirm success, got: {result[:300]}"
+        data = parse_json_response(result)
+        assert data['error'] is None, (
+            f"update_vars function-level error: {data['error']}"
+        )
+        assert all(item['error'] is None for item in data['results']), (
+            f'update_vars per-variable errors: {data["results"]}'
         )
 
         # Step 2: Verify via fresh decompilation — Config should appear in output

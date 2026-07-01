@@ -475,6 +475,55 @@ def _resolve_target_to_ea_sync(target: str) -> int:
         return ea
 
 
+_XREF_ADDR_KEYS = ('addr', 'ea')
+_XREF_NAME_KEYS = ('name', 'function')
+
+
+def _parse_xref_item(item: dict) -> tuple[str, str]:
+    """Normalize an xrefs item's addressing keys to ``(addr, name)``.
+
+    Accepts the standard ``addr``/``name`` keys, the aliases ``ea``/``function``,
+    and the legacy ``target`` key (auto-detected: a ``0x``-prefixed value is an
+    address, any other string is a function name). Returns ``('', '')`` when
+    nothing is provided.
+    """
+    addr = ''
+    for k in _XREF_ADDR_KEYS:
+        v = item.get(k)
+        if v:
+            addr = str(v)
+            break
+    name = ''
+    for k in _XREF_NAME_KEYS:
+        v = item.get(k)
+        if v:
+            name = str(v)
+            break
+    if not addr and not name:
+        legacy = item.get('target')
+        if legacy:
+            legacy = str(legacy)
+            if legacy.lower().startswith('0x'):
+                addr = legacy
+            else:
+                name = legacy
+    return addr, name
+
+
+def _flatten_xref_item(echo: dict, direction: str, list_result: 'ListResult') -> dict:
+    """Build the flat per-item xrefs result.
+
+    Echoes the resolved identity (``addr``/``name``), the ``direction``, and the
+    ListResult's fields (rows under ``items``) with ``error`` at the top level —
+    no ``['result']`` wrapper, matching the sibling items-batched tools. The echo
+    keys always win over ListResult fields.
+    """
+    out: dict = {**echo, 'direction': direction, 'error': None}
+    for key, value in list_result.model_dump().items():
+        out.setdefault(key, value)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # xrefs (merged)
 # ---------------------------------------------------------------------------
@@ -483,44 +532,56 @@ def _resolve_target_to_ea_sync(target: str) -> int:
 async def xrefs(items: list[dict]) -> list[dict]:
     """Cross-references. MERGED from find_xrefs_to_addr + find_xrefs_from_addr + find_xrefs_to_func.
 
-    Each item in ``items`` is a dict with keys:
-    - target: hex address string (e.g. '0x401000') OR function name string
-      Auto-detection: starts with '0x' -> address, otherwise -> function name resolved to entry point
+    Each item in ``items`` is a dict addressed like every other tool:
+    - addr: hex address string (e.g. '0x401000'), OR
+    - name: function name string
+      (aliases accepted: 'ea' for addr, 'function' for name, and the legacy
+      'target' which is auto-detected — '0x'-prefixed -> address, else name)
     - direction: 'to' (default) or 'from'
     - offset: pagination start (default 0)
     - limit: max results per item (default 500)
 
-    RETURNS: list of dicts, each with:
-    - target: input target value
+    RETURNS: a flat list of dicts (the sibling contract — no ['result'] wrapper),
+    each with:
+    - addr: resolved address (hex); name: echoed when provided
     - direction: 'to' or 'from'
-    - result: ListResult (on success)
+    - items: cross-reference rows; plus the ListResult fields (summary,
+      entry_type, schema_version, page_info)
     - error: null on success, error message string on failure"""
     if not isinstance(items, list):
         items = [items]
     results: list[dict] = []
     for item in items:
-        target: str = item.get('target', '') or ''
+        addr_in, name_in = _parse_xref_item(item)
         direction: str = item.get('direction', 'to') or 'to'
         item_offset: int = int(item.get('offset', 0) or 0)
         item_limit: int = int(item.get('limit', 500) or 500)
 
+        err_echo: dict = {}
+        if addr_in:
+            err_echo['addr'] = addr_in
+        if name_in:
+            err_echo['name'] = name_in
+
         if item_offset < 0:
             results.append({
-                'target': target,
+                **err_echo,
                 'direction': direction,
                 'error': 'offset must be non-negative',
             })
             continue
         if item_limit <= 0:
             results.append({
-                'target': target,
+                **err_echo,
                 'direction': direction,
                 'error': 'limit must be positive',
             })
             continue
 
         try:
-            ea = await run_on_ida_main_async(_resolve_target_to_ea_sync, target)
+            ea = await run_on_ida_main_async(
+                _resolve_target_to_ea_sync, addr_in or name_in
+            )
 
             if direction == 'to':
                 list_result = await run_on_ida_main_async(
@@ -533,12 +594,10 @@ async def xrefs(items: list[dict]) -> list[dict]:
             else:
                 raise ToolError(f"direction must be 'to' or 'from', got {direction!r}")
 
-            results.append({
-                'target': target,
-                'direction': direction,
-                'result': list_result,
-                'error': None,
-            })
+            echo: dict = {'addr': f'{ea:#x}'}
+            if name_in:
+                echo['name'] = name_in
+            results.append(_flatten_xref_item(echo, direction, list_result))
         except Exception as e:
-            results.append({'target': target, 'direction': direction, 'error': str(e)})
+            results.append({**err_echo, 'direction': direction, 'error': str(e)})
     return results

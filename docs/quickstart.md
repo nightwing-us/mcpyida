@@ -124,7 +124,7 @@ Use decompile tool with the function name or address
 See where a function is called:
 
 ```
-Use xrefs tool with direction="to" and target="function_name"
+Use xrefs tool with direction="to" and name="function_name" (or addr="0x401000")
 ```
 
 ### Patch Instructions
